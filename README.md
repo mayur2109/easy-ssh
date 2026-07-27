@@ -4,7 +4,7 @@
 name, its connection details, and a remote working directory, then connect with:
 
 ```bash
-ssh project
+ssh demo
 ```
 
 Only the exact interactive form `ssh <project>` is intercepted. Commands such
@@ -36,27 +36,27 @@ changing existing files.
 Create a new SSH connection:
 
 ```bash
-easy-ssh add project \
+easy-ssh add demo \
   --host server.example.com \
   --user deploy \
   --port 2222 \
   --identity ~/.ssh/id_ed25519 \
-  --path ~/projects/avarya
+  --path ~/projects/demo
 ```
 
 Use a connection already defined in `~/.ssh/config`:
 
 ```bash
-easy-ssh add project --ssh-alias production --path ~/projects/avarya
+easy-ssh add demo --ssh-alias production --path ~/projects/demo
 ```
 
 Other commands:
 
 ```bash
 easy-ssh list
-easy-ssh edit project --path /srv/avarya
-easy-ssh connect project
-easy-ssh remove project
+easy-ssh edit demo --path /srv/demo
+easy-ssh connect demo
+easy-ssh remove demo
 easy-ssh doctor
 ```
 
