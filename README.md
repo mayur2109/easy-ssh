@@ -4,7 +4,7 @@
 name, its connection details, and a remote working directory, then connect with:
 
 ```bash
-ssh avarya
+ssh project
 ```
 
 Only the exact interactive form `ssh <project>` is intercepted. Commands such
@@ -36,7 +36,7 @@ changing existing files.
 Create a new SSH connection:
 
 ```bash
-easy-ssh add avarya \
+easy-ssh add project \
   --host server.example.com \
   --user deploy \
   --port 2222 \
@@ -47,16 +47,16 @@ easy-ssh add avarya \
 Use a connection already defined in `~/.ssh/config`:
 
 ```bash
-easy-ssh add avarya --ssh-alias production --path ~/projects/avarya
+easy-ssh add project --ssh-alias production --path ~/projects/avarya
 ```
 
 Other commands:
 
 ```bash
 easy-ssh list
-easy-ssh edit avarya --path /srv/avarya
-easy-ssh connect avarya
-easy-ssh remove avarya
+easy-ssh edit project --path /srv/avarya
+easy-ssh connect project
+easy-ssh remove project
 easy-ssh doctor
 ```
 
