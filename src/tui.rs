@@ -9,7 +9,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::Stylize;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -84,7 +84,7 @@ enum Screen {
     ConfirmDelete,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionMode {
     New,
     Existing,
@@ -289,12 +289,7 @@ impl App {
                 form.error = None;
             }
             KeyCode::Left | KeyCode::Right if form.focus == 1 => {
-                form.mode = if form.mode == ConnectionMode::New {
-                    ConnectionMode::Existing
-                } else {
-                    ConnectionMode::New
-                };
-                form.focus = form.focus.min(form.field_count() - 1);
+                form.toggle_mode();
                 form.error = None;
             }
             KeyCode::Left if form.mode == ConnectionMode::Existing && form.focus == 2 => {
@@ -303,12 +298,12 @@ impl App {
             KeyCode::Right if form.mode == ConnectionMode::Existing && form.focus == 2 => {
                 form.cycle_alias(&self.aliases, true);
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if form.is_editable_focus() => {
                 form.current_value_mut().pop();
                 form.error = None;
             }
             KeyCode::Char(character)
-                if !key.modifiers.contains(KeyModifiers::CONTROL) && form.focus != 1 =>
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && form.is_editable_focus() =>
             {
                 form.current_value_mut().push(character);
                 form.error = None;
@@ -409,14 +404,45 @@ impl App {
     }
 
     fn draw_form(&self, frame: &mut ratatui::Frame, form: &ProjectForm) {
+        if frame.area().width < 28 || frame.area().height < 8 {
+            frame.render_widget(Clear, frame.area());
+            frame.render_widget(
+                Paragraph::new("Terminal too small for the project form")
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Yellow)),
+                frame.area(),
+            );
+            return;
+        }
+
         let width = frame.area().width.saturating_sub(4).min(72);
-        let height = (form.field_count() as u16 * 3 + 6).min(frame.area().height.saturating_sub(2));
+        let height = (form.field_count() as u16 * 3 + 4).min(frame.area().height.saturating_sub(2));
         let area = centered_rect(width, height, frame.area());
         frame.render_widget(Clear, area);
-        let title = if form.original_name.is_some() {
-            " Edit project "
+        let action = if form.original_name.is_some() {
+            "Edit project"
         } else {
-            " Add project "
+            "Add project"
+        };
+        let inner_height = area.height.saturating_sub(2);
+        let visible_count = usize::from(inner_height.saturating_sub(2) / 3)
+            .max(1)
+            .min(form.field_count());
+        let first_visible = form
+            .focus
+            .saturating_add(1)
+            .saturating_sub(visible_count)
+            .min(form.field_count().saturating_sub(visible_count));
+        let last_visible = first_visible + visible_count;
+        let title = if visible_count < form.field_count() {
+            format!(
+                " {action} · fields {}-{} of {} ",
+                first_visible + 1,
+                last_visible,
+                form.field_count()
+            )
+        } else {
+            format!(" {action} ")
         };
         let block = Block::default()
             .title(title)
@@ -425,32 +451,66 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let mut constraints = vec![Constraint::Length(3); form.field_count()];
+        let mut constraints = vec![Constraint::Length(3); visible_count];
         constraints.push(Constraint::Min(2));
         let rows = Layout::vertical(constraints).split(inner);
-        for (index, (label, value)) in form.fields().into_iter().enumerate() {
-            let focused = index == form.focus;
-            let border = if focused { ACCENT } else { MUTED };
-            let widget = Paragraph::new(value)
+        let fields = form.fields();
+        for (row_index, field_index) in (first_visible..last_visible).enumerate() {
+            let (label, value) = &fields[field_index];
+            let row = rows[row_index];
+            if row.height < 3 {
+                continue;
+            }
+            let focused = field_index == form.focus;
+            let border = if focused { Color::Yellow } else { MUTED };
+            let field_title = if focused {
+                format!(" > {label} ")
+            } else {
+                format!(" {label} ")
+            };
+            let input_width = row.width.saturating_sub(2);
+            let (scroll, cursor_column) = input_view(value, input_width);
+            let value_style = if focused {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let widget = Paragraph::new(value.as_str())
+                .style(value_style)
+                .scroll((0, scroll))
                 .block(
                     Block::default()
-                        .title(format!(" {label} "))
+                        .title(field_title)
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(border)),
-                )
-                .wrap(Wrap { trim: false });
-            frame.render_widget(widget, rows[index]);
+                );
+            frame.render_widget(widget, row);
+
+            if focused && form.is_editable_focus() && input_width > 0 {
+                frame.set_cursor_position(Position::new(row.x + 1 + cursor_column, row.y + 1));
+            }
         }
+        let focused_label = fields[form.focus].0;
         let help = form
             .error
-            .as_deref()
-            .unwrap_or("Up/Down fields   Left/Right connection or alias   Enter save   Esc cancel");
+            .clone()
+            .unwrap_or_else(|| {
+                format!(
+                    "Field: {focused_label} | Tab/Up/Down move | Left/Right choose | Enter save | Esc cancel"
+                )
+            });
         let style = if form.error.is_some() {
             Style::default().fg(Color::Red)
         } else {
             Style::default().fg(MUTED)
         };
-        frame.render_widget(Paragraph::new(help).style(style), rows[form.field_count()]);
+        frame.render_widget(
+            Paragraph::new(help).style(style).wrap(Wrap { trim: true }),
+            rows[visible_count],
+        );
     }
 
     fn draw_delete_confirmation(&self, frame: &mut ratatui::Frame) {
@@ -576,6 +636,24 @@ impl ProjectForm {
         }
     }
 
+    fn is_editable_focus(&self) -> bool {
+        self.focus != 1
+    }
+
+    fn toggle_mode(&mut self) {
+        self.focus = match (self.mode, self.focus) {
+            (ConnectionMode::New, 6) => 3,
+            (ConnectionMode::New, 3..=5) => 2,
+            (ConnectionMode::Existing, 3) => 6,
+            (_, focus) => focus,
+        };
+        self.mode = if self.mode == ConnectionMode::New {
+            ConnectionMode::Existing
+        } else {
+            ConnectionMode::New
+        };
+    }
+
     fn cycle_alias(&mut self, aliases: &[String], forward: bool) {
         if aliases.is_empty() {
             return;
@@ -623,6 +701,19 @@ fn optional_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn input_view(value: &str, width: u16) -> (u16, u16) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let text_width = Line::from(value).width();
+    let cursor_limit = usize::from(width.saturating_sub(1));
+    let scroll = text_width.saturating_sub(cursor_limit);
+    (
+        scroll.min(usize::from(u16::MAX)) as u16,
+        text_width.saturating_sub(scroll).min(cursor_limit) as u16,
+    )
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -637,6 +728,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn form_builds_existing_alias_project() {
@@ -647,5 +739,100 @@ mod tests {
         form.remote_path = "~/avarya".into();
         let project = form.to_project().unwrap();
         assert_eq!(project.ssh_target(), "production");
+    }
+
+    #[test]
+    fn connection_selector_is_not_editable() {
+        let paths = AppPaths::for_home_and_config(
+            PathBuf::from("/tmp/easy-ssh-tui-test"),
+            PathBuf::from("/tmp/easy-ssh-tui-test/config"),
+        );
+        let mut app = App::new(paths, ProjectFile::default());
+        let mut form = ProjectForm::new();
+        form.target = "server.example.com".into();
+        form.focus = 1;
+
+        app.handle_form(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut form,
+        )
+        .unwrap();
+
+        assert_eq!(form.target, "server.example.com");
+    }
+
+    #[test]
+    fn mode_toggle_preserves_remote_path_focus() {
+        let mut form = ProjectForm::new();
+        form.focus = 6;
+        form.toggle_mode();
+        assert_eq!(form.mode, ConnectionMode::Existing);
+        assert_eq!(form.focus, 3);
+
+        form.toggle_mode();
+        assert_eq!(form.mode, ConnectionMode::New);
+        assert_eq!(form.focus, 6);
+    }
+
+    #[test]
+    fn long_input_keeps_cursor_inside_field() {
+        assert_eq!(input_view("short", 10), (0, 5));
+        assert_eq!(input_view("a very long remote path", 10), (14, 9));
+    }
+
+    #[test]
+    fn form_draws_focus_marker_and_terminal_cursor() {
+        let paths = AppPaths::for_home_and_config(
+            PathBuf::from("/tmp/easy-ssh-tui-render"),
+            PathBuf::from("/tmp/easy-ssh-tui-render/config"),
+        );
+        let mut app = App::new(paths, ProjectFile::default());
+        let mut form = ProjectForm::new();
+        form.name = "avarya".into();
+        app.screen = Screen::Form(Box::new(form));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(cursor.x < 80 && cursor.y < 24);
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("> Project name"));
+    }
+
+    #[test]
+    fn compact_form_keeps_the_focused_field_visible() {
+        let paths = AppPaths::for_home_and_config(
+            PathBuf::from("/tmp/easy-ssh-tui-compact"),
+            PathBuf::from("/tmp/easy-ssh-tui-compact/config"),
+        );
+        let mut app = App::new(paths, ProjectFile::default());
+        let mut form = ProjectForm::new();
+        form.focus = 6;
+        form.remote_path = "~/projects/avarya".into();
+        app.screen = Screen::Form(Box::new(form));
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(cursor.x < 40 && cursor.y < 10);
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("fields 7-7 of 7"));
+        assert!(rendered.contains("> Remote folder"));
     }
 }
