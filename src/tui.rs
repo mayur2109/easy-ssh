@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap,
 };
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
@@ -54,6 +55,7 @@ pub fn run(paths: &AppPaths, projects: ProjectFile) -> Result<TuiExit> {
 
     let result = (|| -> Result<TuiExit> {
         loop {
+            app.poll_background();
             terminal.draw(|frame| app.draw(frame))?;
             if event::poll(Duration::from_millis(200))?
                 && let Event::Key(key) = event::read()?
@@ -83,6 +85,9 @@ struct App {
     path_lookup_tx: Sender<PathLookup>,
     path_lookup_rx: Receiver<PathLookup>,
     next_path_request: u64,
+    resolved_paths: HashMap<String, String>,
+    resolved_path_tx: Sender<RemotePathResolution>,
+    resolved_path_rx: Receiver<RemotePathResolution>,
 }
 
 enum Screen {
@@ -120,10 +125,19 @@ struct PathLookup {
     result: Result<Vec<String>, String>,
 }
 
+struct RemotePathResolution {
+    project: String,
+    result: Result<String, String>,
+}
+
 impl App {
     fn new(paths: AppPaths, projects: ProjectFile) -> Self {
         let aliases = ssh::discover_aliases(&paths);
         let (path_lookup_tx, path_lookup_rx) = mpsc::channel();
+        let (resolved_path_tx, resolved_path_rx) = mpsc::channel();
+        for project in &projects.projects {
+            spawn_remote_path_resolution(project.clone(), resolved_path_tx.clone());
+        }
         Self {
             paths,
             projects,
@@ -137,6 +151,9 @@ impl App {
             path_lookup_tx,
             path_lookup_rx,
             next_path_request: 0,
+            resolved_paths: HashMap::new(),
+            resolved_path_tx,
+            resolved_path_rx,
         }
     }
 
@@ -163,7 +180,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Option<TuiExit>> {
-        self.receive_path_lookups();
+        self.poll_background();
         let screen = std::mem::replace(&mut self.screen, Screen::Browse);
         match screen {
             Screen::Browse => {
@@ -187,6 +204,11 @@ impl App {
                 Ok(None)
             }
         }
+    }
+
+    fn poll_background(&mut self) {
+        self.receive_path_lookups();
+        self.receive_remote_path_resolutions();
     }
 
     fn handle_browse(&mut self, key: KeyEvent) -> Result<Option<TuiExit>> {
@@ -357,6 +379,11 @@ impl App {
                         form.error = Some(error.to_string());
                     } else {
                         self.projects = next;
+                        self.resolved_paths.remove(&project.name);
+                        spawn_remote_path_resolution(
+                            project.clone(),
+                            self.resolved_path_tx.clone(),
+                        );
                         self.status = Some((true, format!("Saved {}", project.name)));
                         self.aliases = ssh::discover_aliases(&self.paths);
                         self.selected = self
@@ -443,6 +470,14 @@ impl App {
                     form.suggestions.clear();
                     form.error = Some(error);
                 }
+            }
+        }
+    }
+
+    fn receive_remote_path_resolutions(&mut self) {
+        while let Ok(resolution) = self.resolved_path_rx.try_recv() {
+            if let Ok(path) = resolution.result {
+                self.resolved_paths.insert(resolution.project, path);
             }
         }
     }
@@ -538,7 +573,12 @@ impl App {
             Row::new(vec![
                 Cell::from(project.name.clone()),
                 Cell::from(project.destination()),
-                Cell::from(project.remote_path.clone()),
+                Cell::from(
+                    self.resolved_paths
+                        .get(&project.name)
+                        .cloned()
+                        .unwrap_or_else(|| project.remote_path.clone()),
+                ),
             ])
         });
         let header = Row::new(["PROJECT", "DESTINATION", "REMOTE FOLDER"])
@@ -1058,16 +1098,44 @@ enum LookupConnection {
     },
 }
 
-fn lookup_remote_paths(
-    connection: LookupConnection,
-    typed_path: &str,
-) -> Result<Vec<String>, String> {
-    let (parent, fragment) = split_path_query(typed_path);
+fn spawn_remote_path_resolution(project: Project, sender: Sender<RemotePathResolution>) {
+    thread::spawn(move || {
+        let result = resolve_remote_path(
+            lookup_connection_for_project(&project),
+            &project.remote_path,
+        );
+        let _ = sender.send(RemotePathResolution {
+            project: project.name,
+            result,
+        });
+    });
+}
+
+fn lookup_connection_for_project(project: &Project) -> LookupConnection {
+    match &project.connection {
+        Connection::ExistingAlias { ssh_alias } => LookupConnection::Alias(ssh_alias.clone()),
+        Connection::NewHost {
+            host,
+            user,
+            port,
+            identity_file,
+        } => LookupConnection::NewHost {
+            host: host.clone(),
+            user: user.clone(),
+            port: *port,
+            identity: identity_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        },
+    }
+}
+
+fn command_for_lookup(connection: LookupConnection) -> Result<Command, String> {
     let mut command = Command::new("ssh");
     match connection {
         LookupConnection::Alias(alias) => {
             if alias.is_empty() {
-                return Ok(Vec::new());
+                return Err("no SSH alias configured".into());
             }
             command.arg("--").arg(alias);
         }
@@ -1078,7 +1146,7 @@ fn lookup_remote_paths(
             identity,
         } => {
             if host.is_empty() {
-                return Ok(Vec::new());
+                return Err("no host configured".into());
             }
             if let Some(port) = port {
                 command.args(["-p", &port.to_string()]);
@@ -1090,6 +1158,37 @@ fn lookup_remote_paths(
             command.arg("--").arg(target);
         }
     }
+    Ok(command)
+}
+
+fn resolve_remote_path(connection: LookupConnection, remote_path: &str) -> Result<String, String> {
+    let remote = format!(
+        "p={}; case \"$p\" in '~') p=\"$HOME\";; '~/'*) p=\"$HOME/${{p#~/}}\";; /*) ;; *) p=\"$HOME/$p\";; esac; if cd -- \"$p\" 2>/dev/null; then pwd -P; else printf '%s\\n' \"$p\"; fi",
+        shell_quote_for_remote(remote_path)
+    );
+    let output = command_for_lookup(connection)?
+        .arg(remote)
+        .output()
+        .map_err(|error| format!("path resolution failed: {error}"))?;
+    if !output.status.success() {
+        return Err("path resolution failed on remote host".into());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .last()
+        .filter(|path| path.starts_with('/'))
+        .map(str::to_owned)
+        .ok_or_else(|| "remote host did not return an absolute path".into())
+}
+
+fn lookup_remote_paths(
+    connection: LookupConnection,
+    typed_path: &str,
+) -> Result<Vec<String>, String> {
+    let (parent, fragment) = split_path_query(typed_path);
+    let Ok(mut command) = command_for_lookup(connection) else {
+        return Ok(Vec::new());
+    };
     let remote = format!(
         "p={}; case \"$p\" in '~') p=\"$HOME\";; '~/'*) p=\"$HOME/${{p#~/}}\";; esac; if [ -d \"$p\" ]; then find \"$p\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null; fi",
         shell_quote_for_remote(&parent)
