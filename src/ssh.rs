@@ -188,15 +188,20 @@ pub fn remote_command(remote_path: &str, agent: Agent) -> String {
     let target = remote_path_target(remote_path);
     let launch = match agent {
         Agent::Shell => "exec \"${SHELL:-/bin/sh}\" -l".to_owned(),
-        Agent::Claude => {
-            "if claude --continue; then exec \"${SHELL:-/bin/sh}\" -l; else exec claude; fi".into()
-        }
-        Agent::Codex => {
-            "if codex resume --last; then exec \"${SHELL:-/bin/sh}\" -l; else exec codex; fi".into()
-        }
+        Agent::Claude => agent_login_command("claude --continue", "claude"),
+        Agent::Codex => agent_login_command("codex resume --last", "codex"),
     };
     format!(
         "if cd -- {target} 2>/dev/null; then :; else echo 'easy-ssh: remote folder unavailable; starting in home' >&2; cd; fi; {launch}"
+    )
+}
+
+fn agent_login_command(resume: &str, start: &str) -> String {
+    let command =
+        format!("if {resume}; then exec \"${{SHELL:-/bin/sh}}\" -l; else exec {start}; fi");
+    format!(
+        "login_shell=$(getent passwd \"$(id -un)\" | cut -d: -f7); exec \"${{login_shell:-/bin/sh}}\" -lic {}",
+        shell_quote(&command)
     )
 }
 
@@ -515,6 +520,7 @@ mod tests {
         let args = ghostty_args(&project, Agent::Codex);
         assert_eq!(args[..3], ["-e", "ssh", "-tt"]);
         assert!(args.last().unwrap().contains("codex resume --last"));
+        assert!(args.last().unwrap().contains("login_shell=$(getent passwd"));
         assert!(!args.last().unwrap().contains("tmux"));
     }
 
