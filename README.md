@@ -74,6 +74,8 @@ Other commands:
 easy-ssh list
 easy-ssh edit demo --path /srv/demo
 easy-ssh connect demo
+easy-ssh connect demo --terminal ghostty
+easy-ssh session new demo codex-review
 easy-ssh remove demo
 easy-ssh doctor
 easy-ssh doctor --shell bash --shell zsh
@@ -82,6 +84,22 @@ easy-ssh doctor --shell bash --shell zsh
 Projects are stored in
 `${XDG_CONFIG_HOME:-~/.config}/easy-ssh/projects.toml`. Passwords are never
 stored; OpenSSH continues to handle keys, agents, and password prompts.
+
+## Ghostty and persistent sessions
+
+Press `s` in the TUI to choose Ghostty as the default terminal, or use the
+`--terminal ghostty` override above. Ghostty mode attaches to a remote tmux
+workspace for the project. Closing its window detaches without stopping Claude,
+Codex, or other work in that workspace; reconnecting restores every tmux window.
+
+Use `easy-ssh session new <project> <label>` to create another labelled tmux
+window. tmux must already be installed on the remote host; Easy SSH never
+installs it automatically.
+
+When adding or editing a project, Remote folder offers fuzzy directory matches
+at the typed path's current level. Up/Down selects a match, Tab inserts it, and
+Esc dismisses the list. Every text input supports Left/Right, Home/End,
+Backspace, and Delete.
 
 ## Connection lifetime
 
