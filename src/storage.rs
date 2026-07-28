@@ -1,4 +1,4 @@
-use crate::model::{Project, ProjectFile};
+use crate::model::{Agent, Project, ProjectFile};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -57,29 +57,63 @@ pub struct SessionRegistry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRecord {
     pub project: String,
-    pub workspace: String,
-    pub window_id: String,
+    pub agent: Agent,
+    pub id: String,
     pub label: String,
+    pub workspace: String,
+    pub window: String,
+    #[serde(default = "default_color")]
+    pub color: String,
+}
+
+fn default_color() -> String {
+    "cyan".into()
+}
+
+pub fn load_sessions(paths: &AppPaths) -> Result<SessionRegistry> {
+    if !paths.sessions.exists() {
+        return Ok(SessionRegistry::default());
+    }
+    toml::from_str(&fs::read_to_string(&paths.sessions)?)
+        .with_context(|| format!("failed to parse {}", paths.sessions.display()))
+}
+
+pub fn save_sessions(paths: &AppPaths, registry: &SessionRegistry) -> Result<()> {
+    atomic_write(
+        &paths.sessions,
+        toml::to_string_pretty(registry)?.as_bytes(),
+        0o600,
+    )
 }
 
 pub fn record_session(paths: &AppPaths, record: SessionRecord) -> Result<()> {
-    let mut registry = if paths.sessions.exists() {
-        toml::from_str(&fs::read_to_string(&paths.sessions)?)
-            .with_context(|| format!("failed to parse {}", paths.sessions.display()))?
-    } else {
-        SessionRegistry::default()
-    };
+    let mut registry = load_sessions(paths)?;
     registry
         .sessions
-        .retain(|existing| existing.window_id != record.window_id);
+        .retain(|item| !(item.project == record.project && item.id == record.id));
     registry.sessions.push(record);
-    registry.sessions.sort_by(|left, right| {
-        left.project
-            .cmp(&right.project)
-            .then(left.label.cmp(&right.label))
-    });
-    let contents = toml::to_string_pretty(&registry)?;
-    atomic_write(&paths.sessions, contents.as_bytes(), 0o600)
+    registry
+        .sessions
+        .sort_by(|a, b| a.project.cmp(&b.project).then(a.label.cmp(&b.label)));
+    save_sessions(paths, &registry)
+}
+
+pub fn cycle_color(paths: &AppPaths, project: &str, id: &str) -> Result<String> {
+    const COLORS: [&str; 6] = ["cyan", "green", "yellow", "magenta", "blue", "red"];
+    let mut registry = load_sessions(paths)?;
+    let record = registry
+        .sessions
+        .iter_mut()
+        .find(|item| item.project == project && item.id == id)
+        .with_context(|| format!("session {id:?} does not exist"))?;
+    let index = COLORS
+        .iter()
+        .position(|color| *color == record.color)
+        .unwrap_or(0);
+    record.color = COLORS[(index + 1) % COLORS.len()].into();
+    let color = record.color.clone();
+    save_sessions(paths, &registry)?;
+    Ok(color)
 }
 
 pub fn load(paths: &AppPaths) -> Result<ProjectFile> {

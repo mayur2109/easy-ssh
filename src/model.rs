@@ -36,6 +36,25 @@ pub enum TerminalMode {
     Ghostty,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Agent {
+    Shell,
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "Shell",
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Project {
     pub name: String,

@@ -1,6 +1,5 @@
-use crate::model::{Connection, Project, ProjectFile, TerminalMode};
-use crate::storage::{AppPaths, atomic_write, set_mode};
-#[cfg(not(unix))]
+use crate::model::{Agent, Connection, Project, ProjectFile, TerminalMode};
+use crate::storage::{AppPaths, SessionRecord, atomic_write, set_mode};
 use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -184,7 +183,8 @@ ssh() {
 # <<< easy-ssh shell hook <<<"#
 }
 
-pub fn remote_command(remote_path: &str) -> String {
+pub fn remote_command(remote_path: &str, agent: Agent) -> String {
+    let _ = agent;
     let target = remote_path_target(remote_path);
     format!(
         "if cd -- {target} 2>/dev/null; then :; else echo 'easy-ssh: remote folder unavailable; starting in home' >&2; cd; fi; exec \"${{SHELL:-/bin/sh}}\" -l"
@@ -201,17 +201,17 @@ fn remote_path_target(remote_path: &str) -> String {
     }
 }
 
-pub fn connect_args(project: &Project) -> Vec<String> {
+pub fn connect_args(project: &Project, agent: Agent) -> Vec<String> {
     vec![
         "-t".into(),
         "--".into(),
         project.ssh_target().into(),
-        remote_command(&project.remote_path),
+        remote_command(&project.remote_path, agent),
     ]
 }
 
-pub fn connect(project: &Project) -> Result<()> {
-    let args = connect_args(project);
+pub fn connect(project: &Project, agent: Agent) -> Result<()> {
+    let args = connect_args(project, agent);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -225,6 +225,37 @@ pub fn connect(project: &Project) -> Result<()> {
             Ok(())
         } else {
             bail!("ssh exited with {status}")
+        }
+    }
+}
+
+pub fn ghostty_args(project: &Project, agent: Agent) -> Vec<String> {
+    vec![
+        "-e".into(),
+        "ssh".into(),
+        "-tt".into(),
+        project.ssh_target().into(),
+        remote_command(&project.remote_path, agent),
+    ]
+}
+
+pub fn connect_with_terminal(
+    project: &Project,
+    terminal: TerminalMode,
+    agent: Agent,
+) -> Result<()> {
+    match terminal {
+        TerminalMode::Current => connect(project, agent),
+        TerminalMode::Ghostty => {
+            let status = Command::new("ghostty")
+                .args(ghostty_args(project, agent))
+                .status()
+                .context("failed to launch Ghostty; install Ghostty or use --terminal current")?;
+            if status.success() {
+                Ok(())
+            } else {
+                anyhow::bail!("Ghostty exited with {status}")
+            }
         }
     }
 }
@@ -245,67 +276,191 @@ pub fn tmux_workspace(project: &Project) -> String {
     format!("easy-ssh-{name}")
 }
 
+fn tmux_required() -> &'static str {
+    "command -v tmux >/dev/null 2>&1 || { echo 'easy-ssh: tmux is required for persistent agent sessions. Install it on this host and try again.' >&2; exit 127; };"
+}
+
 pub fn tmux_attach_command(project: &Project) -> String {
     let workspace = shell_quote(&tmux_workspace(project));
     format!(
-        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path}; exec tmux attach-session -t {workspace}",
-        path = remote_path_target(&project.remote_path),
+        "{} tmux new-session -Ad -s {workspace} -c {path}; exec tmux attach-session -t {workspace}",
+        tmux_required(),
+        path = remote_path_target(&project.remote_path)
     )
 }
 
-pub fn ghostty_args(project: &Project) -> Vec<String> {
-    vec![
+pub fn session_attach_command(_project: &Project, session: &SessionRecord) -> String {
+    let workspace = shell_quote(&session.workspace);
+    let window = shell_quote(&format!("{}:{}", session.workspace, session.window));
+    format!(
+        "{} tmux has-session -t {workspace} 2>/dev/null || {{ echo 'easy-ssh: session is not active; create or resume it from the session picker.' >&2; exit 1; }}; tmux select-window -t {window}; exec tmux attach-session -t {workspace}",
+        tmux_required()
+    )
+}
+
+pub fn connect_session(
+    project: &Project,
+    session: &SessionRecord,
+    terminal: TerminalMode,
+) -> Result<()> {
+    connect_custom_command(project, terminal, session_attach_command(project, session))
+}
+
+pub fn connect_workspace(project: &Project, terminal: TerminalMode) -> Result<()> {
+    connect_custom_command(project, terminal, tmux_attach_command(project))
+}
+
+fn connect_custom_command(
+    project: &Project,
+    terminal: TerminalMode,
+    command: String,
+) -> Result<()> {
+    let args = vec![
         "-e".into(),
         "ssh".into(),
         "-tt".into(),
         project.ssh_target().into(),
-        tmux_attach_command(project),
-    ]
-}
-
-pub fn connect_with_terminal(project: &Project, terminal: TerminalMode) -> Result<()> {
+        command,
+    ];
     match terminal {
-        TerminalMode::Current => connect(project),
-        TerminalMode::Ghostty => {
-            let status = Command::new("ghostty")
-                .args(ghostty_args(project))
-                .status()
-                .context("failed to launch Ghostty; install Ghostty or use --terminal current")?;
+        TerminalMode::Current => {
+            let status = Command::new("ssh")
+                .args(["-tt", "--", project.ssh_target(), &args[4]])
+                .status()?;
             if status.success() {
                 Ok(())
             } else {
-                anyhow::bail!("Ghostty exited with {status}")
+                bail!("ssh exited with {status}")
+            }
+        }
+        TerminalMode::Ghostty => {
+            let status = Command::new("ghostty")
+                .args(args)
+                .status()
+                .context("failed to launch Ghostty")?;
+            if status.success() {
+                Ok(())
+            } else {
+                bail!("Ghostty exited with {status}")
             }
         }
     }
 }
 
-pub fn create_tmux_window(project: &Project, label: &str) -> Result<String> {
+pub fn create_agent_session(
+    project: &Project,
+    agent: Agent,
+    id: &str,
+    label: &str,
+) -> Result<SessionRecord> {
     let label = label.trim();
-    if label.is_empty() || label.contains('\n') || label.contains('\r') {
-        anyhow::bail!("session label cannot be empty or contain a newline");
+    if label.is_empty() || label.contains(['\n', '\r']) {
+        anyhow::bail!("session name cannot be empty or contain a newline");
     }
     let workspace = tmux_workspace(project);
-    let target = shell_quote(&format!("{workspace}:{label}"));
+    let window = format!(
+        "{}-{}",
+        agent.label().to_ascii_lowercase(),
+        id.split('-').next().unwrap_or(id)
+    );
+    let agent_command = match agent {
+        Agent::Shell => {
+            anyhow::bail!("persistent sessions require --agent claude or --agent codex")
+        }
+        Agent::Claude => format!(
+            "exec claude --session-id {} --name {}",
+            shell_quote(id),
+            shell_quote(label)
+        ),
+        Agent::Codex => "exec codex".into(),
+    };
+    let login = format!(
+        "login_shell=$(getent passwd \"$(id -un)\" | cut -d: -f7); exec \"${{login_shell:-/bin/sh}}\" -lic {}",
+        shell_quote(&agent_command)
+    );
     let remote = format!(
-        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path}; tmux new-window -t {workspace}: -n {label} -c {path}; tmux display-message -p -t {target} '#{{window_id}}'",
+        "{} tmux new-session -Ad -s {workspace} -c {path}; tmux new-window -d -t {workspace}: -n {window} -c {path} {login}; tmux select-window -t {workspace}:{window}",
+        tmux_required(),
         workspace = shell_quote(&workspace),
-        label = shell_quote(label),
+        window = shell_quote(&window),
         path = remote_path_target(&project.remote_path),
+        login = shell_quote(&login)
+    );
+    let status = Command::new("ssh")
+        .args(["--", project.ssh_target(), &remote])
+        .status()
+        .context("failed to create remote agent session")?;
+    if !status.success() {
+        bail!("remote tmux setup exited with {status}");
+    }
+    Ok(SessionRecord {
+        project: project.name.clone(),
+        agent,
+        id: id.into(),
+        label: label.into(),
+        workspace,
+        window,
+        color: "cyan".into(),
+    })
+}
+
+pub fn resume_agent_session(project: &Project, session: &SessionRecord) -> Result<()> {
+    let agent_command = match session.agent {
+        Agent::Shell => anyhow::bail!("saved Shell sessions cannot be resumed"),
+        Agent::Claude => format!("exec claude --resume {}", shell_quote(&session.id)),
+        Agent::Codex => "exec codex resume".into(),
+    };
+    let login = format!(
+        "login_shell=$(getent passwd \"$(id -un)\" | cut -d: -f7); exec \"${{login_shell:-/bin/sh}}\" -lic {}",
+        shell_quote(&agent_command)
+    );
+    let remote = format!(
+        "{} tmux new-session -Ad -s {workspace} -c {path}; tmux new-window -d -t {workspace}: -n {window} -c {path} {login}; tmux select-window -t {workspace}:{window}",
+        tmux_required(),
+        workspace = shell_quote(&session.workspace),
+        window = shell_quote(&session.window),
+        path = remote_path_target(&project.remote_path),
+        login = shell_quote(&login)
+    );
+    let status = Command::new("ssh")
+        .args(["--", project.ssh_target(), &remote])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("remote agent resume setup exited with {status}")
+    }
+}
+
+pub fn active_session_windows(project: &Project) -> Result<BTreeSet<String>> {
+    let workspace = tmux_workspace(project);
+    let remote = format!(
+        "command -v tmux >/dev/null 2>&1 && tmux list-windows -t {} -F '#{{window_name}}' 2>/dev/null || true",
+        shell_quote(&workspace)
     );
     let output = Command::new("ssh")
         .args(["--", project.ssh_target(), &remote])
-        .output()
-        .context("failed to create remote tmux session")?;
-    if output.status.success() {
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .last()
-            .filter(|window_id| !window_id.is_empty())
-            .map(str::to_owned)
-            .context("remote tmux did not return a window ID")
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+pub fn set_session_color(project: &Project, session: &SessionRecord, color: &str) -> Result<()> {
+    let remote = format!(
+        "tmux set-window-option -t {window} @easy_ssh_color {color} 2>/dev/null || true; tmux set-option -t {workspace} window-status-format '#[fg=#{{@easy_ssh_color}}]#W#[default]' 2>/dev/null || true",
+        window = shell_quote(&format!("{}:{}", session.workspace, session.window)),
+        workspace = shell_quote(&session.workspace),
+        color = shell_quote(color),
+    );
+    let status = Command::new("ssh")
+        .args(["--", project.ssh_target(), &remote])
+        .status()?;
+    if status.success() {
+        Ok(())
     } else {
-        anyhow::bail!("remote tmux setup exited with {}", output.status)
+        bail!("failed to update remote tmux session color")
     }
 }
 
@@ -485,7 +640,7 @@ fn backup_once(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Connection;
+    use crate::model::{Agent, Connection};
     use crate::storage::AppPaths;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -541,19 +696,24 @@ mod tests {
 
     #[test]
     fn quotes_remote_paths_and_expands_home() {
-        let command = remote_command("~/work/A user's app");
+        let command = remote_command("~/work/A user's app", Agent::Claude);
         assert!(command.contains("\"$HOME\"/'work/A user'\"'\"'s app'"));
         assert!(command.contains("remote folder unavailable"));
         assert!(command.ends_with("exec \"${SHELL:-/bin/sh}\" -l"));
     }
 
     #[test]
-    fn ghostty_attaches_to_a_stable_tmux_workspace() {
+    fn ghostty_uses_the_plain_ssh_agent_command() {
         let project = new_project();
-        assert_eq!(tmux_workspace(&project), "easy-ssh-avarya");
-        let args = ghostty_args(&project);
+        let args = ghostty_args(&project, Agent::Codex);
         assert_eq!(args[..3], ["-e", "ssh", "-tt"]);
-        assert!(args.last().unwrap().contains("tmux new-session -Ad"));
+        assert!(!args.last().unwrap().contains("tmux"));
+    }
+
+    #[test]
+    fn normal_connections_do_not_launch_agents() {
+        assert!(!remote_command("~/work", Agent::Claude).contains("claude"));
+        assert!(!remote_command("~/work", Agent::Codex).contains("codex"));
     }
 
     #[test]
