@@ -248,7 +248,7 @@ pub fn tmux_workspace(project: &Project) -> String {
 pub fn tmux_attach_command(project: &Project) -> String {
     let workspace = shell_quote(&tmux_workspace(project));
     format!(
-        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path}; exec tmux attach-session -t {workspace}",
+        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path} 'exec \"${{SHELL:-/bin/sh}}\" -l'; tmux set-option -t {workspace} status off; exec tmux attach-session -t {workspace}",
         path = remote_path_target(&project.remote_path),
     )
 }
@@ -288,7 +288,7 @@ pub fn create_tmux_window(project: &Project, label: &str) -> Result<String> {
     let workspace = tmux_workspace(project);
     let target = shell_quote(&format!("{workspace}:{label}"));
     let remote = format!(
-        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path}; tmux new-window -t {workspace}: -n {label} -c {path}; tmux display-message -p -t {target} '#{{window_id}}'",
+        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path} 'exec \"${{SHELL:-/bin/sh}}\" -l'; tmux set-option -t {workspace} status off; tmux new-window -t {workspace}: -n {label} -c {path} 'exec \"${{SHELL:-/bin/sh}}\" -l'; tmux display-message -p -t {target} '#{{window_id}}'",
         workspace = shell_quote(&workspace),
         label = shell_quote(label),
         path = remote_path_target(&project.remote_path),
@@ -554,6 +554,8 @@ mod tests {
         let args = ghostty_args(&project);
         assert_eq!(args[..3], ["-e", "ssh", "-tt"]);
         assert!(args.last().unwrap().contains("tmux new-session -Ad"));
+        assert!(args.last().unwrap().contains("status off"));
+        assert!(args.last().unwrap().contains("${SHELL:-/bin/sh}"));
     }
 
     #[test]

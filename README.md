@@ -91,6 +91,9 @@ Press `s` in the TUI to choose Ghostty as the default terminal, or use the
 `--terminal ghostty` override above. Ghostty mode attaches to a remote tmux
 workspace for the project. Closing its window detaches without stopping Claude,
 Codex, or other work in that workspace; reconnecting restores every tmux window.
+Easy SSH starts the normal remote login shell inside that workspace and hides the
+tmux status bar, so the terminal experience matches a manual SSH session while
+the session remains durable.
 
 Use `easy-ssh session new <project> <label>` to create another labelled tmux
 window. tmux must already be installed on the remote host; Easy SSH never
