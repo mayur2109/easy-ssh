@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal project manager for SSH connections and remote working directories"
 license = "MIT"
+repository = "https://github.com/mayur2109/easy-ssh"
 
 [dependencies]
 anyhow = "1.0"

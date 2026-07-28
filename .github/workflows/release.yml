@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate tag and package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          if [[ ! "$tag_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag $GITHUB_REF_NAME is not a supported semantic version" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" != "$manifest_version" ]]; then
+            echo "Tag version $tag_version does not match Cargo.toml version $manifest_version" >&2
+            exit 1
+          fi
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: easy-ssh-x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: easy-ssh-aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: easy-ssh-x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: easy-ssh-aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Create archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${{ matrix.archive }}"
+          mkdir "$archive"
+          cp "target/${{ matrix.target }}/release/easy-ssh" "$archive/"
+          cp README.md LICENSE "$archive/"
+          tar -czf "$archive.tar.gz" "$archive"
+          shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256"
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.tar.gz
+            ${{ matrix.archive }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+          done
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+            exit 0
+          fi
+
+          release_args=(--verify-tag --generate-notes --title "easy-ssh $tag")
+          if [[ "$tag" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$tag" dist/* "${release_args[@]}"

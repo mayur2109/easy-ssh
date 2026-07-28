@@ -19,8 +19,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Install SSH include and Bash shell integration
-    Install,
+    /// Install SSH include and shell integration
+    Install {
+        /// Shell startup file to configure; repeat to configure both
+        #[arg(long, value_enum)]
+        shell: Vec<ssh::Shell>,
+    },
     /// List saved projects
     List,
     /// Add a project
@@ -37,7 +41,11 @@ enum Command {
     /// Connect to a project
     Connect { name: String },
     /// Check configuration and shell integration
-    Doctor,
+    Doctor {
+        /// Shell startup file to check; repeat to check both
+        #[arg(long, value_enum)]
+        shell: Vec<ssh::Shell>,
+    },
     #[command(name = "__is-project", hide = true)]
     IsProject { name: String },
 }
@@ -105,14 +113,20 @@ fn run() -> Result<()> {
                 ssh::connect(project)
             }
         },
-        Some(Command::Install) => {
+        Some(Command::Install { shell }) => {
+            let shells = ssh::selected_shells(&shell)?;
             if !paths.registry.exists() {
                 storage::save(&paths, &file)?;
             }
-            for change in ssh::install(&paths, &file)? {
+            for change in ssh::install(&paths, &file, &shells)? {
                 println!("{change}");
             }
-            println!("Reload Bash with: source ~/.bashrc");
+            for shell in shells {
+                match shell {
+                    ssh::Shell::Bash => println!("Reload Bash with: source ~/.bashrc"),
+                    ssh::Shell::Zsh => println!("Reload Zsh with: source ~/.zshrc"),
+                }
+            }
             Ok(())
         }
         Some(Command::List) => {
@@ -164,8 +178,9 @@ fn run() -> Result<()> {
             let project = find_project(&file, &name)?;
             ssh::connect(project)
         }
-        Some(Command::Doctor) => {
-            let checks = ssh::doctor(&paths, &file);
+        Some(Command::Doctor { shell }) => {
+            let shells = ssh::selected_shells(&shell)?;
+            let checks = ssh::doctor(&paths, &file, &shells);
             let mut healthy = true;
             for (ok, message) in checks {
                 println!("{} {message}", if ok { "[ok]" } else { "[fail]" });

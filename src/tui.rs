@@ -193,7 +193,9 @@ impl App {
             KeyCode::Char('d') | KeyCode::Delete if self.selected_project().is_some() => {
                 self.screen = Screen::ConfirmDelete;
             }
-            KeyCode::Char('i') => match ssh::install(&self.paths, &self.projects) {
+            KeyCode::Char('i') => match ssh::selected_shells(&[])
+                .and_then(|shells| ssh::install(&self.paths, &self.projects, &shells))
+            {
                 Ok(changes) => {
                     self.status = Some((
                         true,

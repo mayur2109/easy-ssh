@@ -15,6 +15,7 @@ pub struct AppPaths {
     pub ssh_config: PathBuf,
     pub managed_ssh_config: PathBuf,
     pub bashrc: PathBuf,
+    pub zshrc: PathBuf,
 }
 
 impl AppPaths {
@@ -36,6 +37,7 @@ impl AppPaths {
             ssh_config: ssh_dir.join("config"),
             managed_ssh_config: ssh_dir.join("easy-ssh.conf"),
             bashrc: home.join(".bashrc"),
+            zshrc: home.join(".zshrc"),
             home,
             config_dir,
             ssh_dir,

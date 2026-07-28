@@ -3,8 +3,11 @@ use crate::storage::{AppPaths, atomic_write, set_mode};
 #[cfg(not(unix))]
 use anyhow::bail;
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use glob::glob;
 use std::collections::BTreeSet;
+use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +16,50 @@ pub const INCLUDE_LINE: &str = "Include ~/.ssh/easy-ssh.conf";
 const INCLUDE_MARKER: &str = "# easy-ssh managed include";
 const HOOK_START: &str = "# >>> easy-ssh shell hook >>>";
 const HOOK_END: &str = "# <<< easy-ssh shell hook <<<";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Shell {
+    Bash,
+    Zsh,
+}
+
+impl Shell {
+    fn startup_file(self, paths: &AppPaths) -> &Path {
+        match self {
+            Self::Bash => &paths.bashrc,
+            Self::Zsh => &paths.zshrc,
+        }
+    }
+}
+
+pub fn selected_shells(explicit: &[Shell]) -> Result<Vec<Shell>> {
+    resolve_shells(explicit, env::var_os("SHELL").as_deref())
+}
+
+fn resolve_shells(explicit: &[Shell], login_shell: Option<&OsStr>) -> Result<Vec<Shell>> {
+    if !explicit.is_empty() {
+        let mut selected = Vec::new();
+        for shell in explicit {
+            if !selected.contains(shell) {
+                selected.push(*shell);
+            }
+        }
+        return Ok(selected);
+    }
+
+    let login_shell = login_shell
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .unwrap_or("");
+    match login_shell {
+        "bash" => Ok(vec![Shell::Bash]),
+        "zsh" => Ok(vec![Shell::Zsh]),
+        _ => anyhow::bail!(
+            "could not detect a supported shell from $SHELL; use --shell bash or --shell zsh"
+        ),
+    }
+}
 
 pub fn generated_config(file: &ProjectFile) -> String {
     let mut output =
@@ -39,6 +86,8 @@ pub fn generated_config(file: &ProjectFile) -> String {
                     quote_config(&identity_file.to_string_lossy())
                 ));
             }
+            output.push_str("    ServerAliveInterval 30\n");
+            output.push_str("    ServerAliveCountMax 3\n");
             output.push('\n');
         }
     }
@@ -69,7 +118,7 @@ pub fn validate_connection_name(paths: &AppPaths, project: &Project) -> Result<(
     Ok(())
 }
 
-pub fn install(paths: &AppPaths, file: &ProjectFile) -> Result<Vec<String>> {
+pub fn install(paths: &AppPaths, file: &ProjectFile, shells: &[Shell]) -> Result<Vec<String>> {
     fs::create_dir_all(&paths.config_dir)?;
     fs::create_dir_all(&paths.ssh_dir)?;
     set_mode(&paths.ssh_dir, 0o700)?;
@@ -78,8 +127,11 @@ pub fn install(paths: &AppPaths, file: &ProjectFile) -> Result<Vec<String>> {
     if ensure_include(paths)? {
         changes.push(format!("updated {}", paths.ssh_config.display()));
     }
-    if ensure_bash_hook(paths)? {
-        changes.push(format!("updated {}", paths.bashrc.display()));
+    for shell in shells {
+        let startup_file = shell.startup_file(paths);
+        if ensure_shell_hook(startup_file)? {
+            changes.push(format!("updated {}", startup_file.display()));
+        }
     }
     sync_generated_config(paths, file)?;
     changes.push(format!("generated {}", paths.managed_ssh_config.display()));
@@ -104,23 +156,23 @@ fn ensure_include(paths: &AppPaths) -> Result<bool> {
     Ok(true)
 }
 
-fn ensure_bash_hook(paths: &AppPaths) -> Result<bool> {
-    let old = read_or_empty(&paths.bashrc)?;
+fn ensure_shell_hook(startup_file: &Path) -> Result<bool> {
+    let old = read_or_empty(startup_file)?;
     if old.contains(HOOK_START) && old.contains(HOOK_END) {
         return Ok(false);
     }
-    backup_once(&paths.bashrc)?;
+    backup_once(startup_file)?;
     let separator = if old.is_empty() || old.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    let new = format!("{old}{separator}\n{}\n", bash_hook());
-    atomic_write(&paths.bashrc, new.as_bytes(), 0o600)?;
+    let new = format!("{old}{separator}\n{}\n", shell_hook());
+    atomic_write(startup_file, new.as_bytes(), 0o600)?;
     Ok(true)
 }
 
-pub fn bash_hook() -> &'static str {
+pub fn shell_hook() -> &'static str {
     r#"# >>> easy-ssh shell hook >>>
 ssh() {
     if [ "$#" -eq 1 ] && command easy-ssh __is-project -- "$1"; then
@@ -243,7 +295,7 @@ fn expand_path(value: &str, base: &Path, home: &Path) -> PathBuf {
     }
 }
 
-pub fn doctor(paths: &AppPaths, file: &ProjectFile) -> Vec<(bool, String)> {
+pub fn doctor(paths: &AppPaths, file: &ProjectFile, shells: &[Shell]) -> Vec<(bool, String)> {
     let mut checks = Vec::new();
     checks.push((
         paths.registry.exists(),
@@ -279,12 +331,15 @@ pub fn doctor(paths: &AppPaths, file: &ProjectFile) -> Vec<(bool, String)> {
             .unwrap_or(false);
         checks.push((syntax_ok, "managed SSH config syntax".into()));
     }
-    checks.push((
-        read_or_empty(&paths.bashrc)
-            .map(|value| value.contains(HOOK_START) && value.contains(HOOK_END))
-            .unwrap_or(false),
-        format!("Bash hook installed: {}", paths.bashrc.display()),
-    ));
+    for shell in shells {
+        let startup_file = shell.startup_file(paths);
+        checks.push((
+            read_or_empty(startup_file)
+                .map(|value| value.contains(HOOK_START) && value.contains(HOOK_END))
+                .unwrap_or(false),
+            format!("{shell:?} hook installed: {}", startup_file.display()),
+        ));
+    }
     for project in &file.projects {
         checks.push((
             project.validate().is_ok(),
@@ -374,7 +429,28 @@ mod tests {
         assert!(generated.contains("Host avarya"));
         assert!(generated.contains("Port 2222"));
         assert!(generated.contains("IdentityFile \"~/.ssh/work key\""));
+        assert!(generated.contains("ServerAliveInterval 30"));
+        assert!(generated.contains("ServerAliveCountMax 3"));
         assert!(!generated.contains("RemoteCommand"));
+    }
+
+    #[test]
+    fn existing_aliases_do_not_generate_managed_host_settings() {
+        let file = ProjectFile {
+            version: 1,
+            projects: vec![Project {
+                name: "prod-app".into(),
+                remote_path: "/srv/app".into(),
+                connection: Connection::ExistingAlias {
+                    ssh_alias: "production".into(),
+                },
+            }],
+        };
+
+        let generated = generated_config(&file);
+
+        assert!(!generated.contains("Host prod-app"));
+        assert!(!generated.contains("ServerAlive"));
     }
 
     #[test]
@@ -397,10 +473,10 @@ mod tests {
             projects: vec![new_project()],
         };
 
-        install(&paths, &file).unwrap();
+        install(&paths, &file, &[Shell::Bash]).unwrap();
         let first_config = fs::read_to_string(&paths.ssh_config).unwrap();
         let first_bashrc = fs::read_to_string(&paths.bashrc).unwrap();
-        install(&paths, &file).unwrap();
+        install(&paths, &file, &[Shell::Bash]).unwrap();
 
         assert_eq!(fs::read_to_string(&paths.ssh_config).unwrap(), first_config);
         assert_eq!(fs::read_to_string(&paths.bashrc).unwrap(), first_bashrc);
@@ -408,6 +484,39 @@ mod tests {
         assert!(first_config.contains("Host old"));
         assert!(first_bashrc.contains("command ssh \"$@\""));
         assert!(PathBuf::from(format!("{}.easy-ssh.bak", paths.ssh_config.display())).exists());
+    }
+
+    #[test]
+    fn installs_selected_shells_and_preserves_each_startup_file() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_home_and_config(temp.path().into(), temp.path().join("xdg"));
+        fs::write(&paths.bashrc, "export BASH_ENV=1\n").unwrap();
+        fs::write(&paths.zshrc, "export ZSH_ENV=1\n").unwrap();
+
+        install(&paths, &ProjectFile::default(), &[Shell::Bash, Shell::Zsh]).unwrap();
+
+        let bashrc = fs::read_to_string(&paths.bashrc).unwrap();
+        let zshrc = fs::read_to_string(&paths.zshrc).unwrap();
+        assert!(bashrc.starts_with("export BASH_ENV=1"));
+        assert!(zshrc.starts_with("export ZSH_ENV=1"));
+        assert!(bashrc.contains(HOOK_START));
+        assert!(zshrc.contains(HOOK_START));
+        assert!(PathBuf::from(format!("{}.easy-ssh.bak", paths.bashrc.display())).exists());
+        assert!(PathBuf::from(format!("{}.easy-ssh.bak", paths.zshrc.display())).exists());
+    }
+
+    #[test]
+    fn resolves_explicit_or_detected_shells() {
+        assert_eq!(
+            resolve_shells(&[], Some(OsStr::new("/usr/bin/zsh"))).unwrap(),
+            vec![Shell::Zsh]
+        );
+        assert_eq!(
+            resolve_shells(&[Shell::Bash, Shell::Bash], None).unwrap(),
+            vec![Shell::Bash]
+        );
+        assert!(resolve_shells(&[], Some(OsStr::new("/bin/fish"))).is_err());
+        assert!(resolve_shells(&[], None).is_err());
     }
 
     #[test]
