@@ -1,4 +1,4 @@
-use crate::model::{Connection, Project, ProjectFile, TerminalMode};
+use crate::model::{Agent, Connection, Project, ProjectFile, TerminalMode};
 use crate::storage::{AppPaths, atomic_write, set_mode};
 #[cfg(not(unix))]
 use anyhow::bail;
@@ -184,10 +184,19 @@ ssh() {
 # <<< easy-ssh shell hook <<<"#
 }
 
-pub fn remote_command(remote_path: &str) -> String {
+pub fn remote_command(remote_path: &str, agent: Agent) -> String {
     let target = remote_path_target(remote_path);
+    let launch = match agent {
+        Agent::Shell => "exec \"${SHELL:-/bin/sh}\" -l".to_owned(),
+        Agent::Claude => {
+            "if claude --continue; then exec \"${SHELL:-/bin/sh}\" -l; else exec claude; fi".into()
+        }
+        Agent::Codex => {
+            "if codex resume --last; then exec \"${SHELL:-/bin/sh}\" -l; else exec codex; fi".into()
+        }
+    };
     format!(
-        "if cd -- {target} 2>/dev/null; then :; else echo 'easy-ssh: remote folder unavailable; starting in home' >&2; cd; fi; exec \"${{SHELL:-/bin/sh}}\" -l"
+        "if cd -- {target} 2>/dev/null; then :; else echo 'easy-ssh: remote folder unavailable; starting in home' >&2; cd; fi; {launch}"
     )
 }
 
@@ -201,17 +210,17 @@ fn remote_path_target(remote_path: &str) -> String {
     }
 }
 
-pub fn connect_args(project: &Project) -> Vec<String> {
+pub fn connect_args(project: &Project, agent: Agent) -> Vec<String> {
     vec![
         "-t".into(),
         "--".into(),
         project.ssh_target().into(),
-        remote_command(&project.remote_path),
+        remote_command(&project.remote_path, agent),
     ]
 }
 
-pub fn connect(project: &Project) -> Result<()> {
-    let args = connect_args(project);
+pub fn connect(project: &Project, agent: Agent) -> Result<()> {
+    let args = connect_args(project, agent);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -229,46 +238,26 @@ pub fn connect(project: &Project) -> Result<()> {
     }
 }
 
-pub fn tmux_workspace(project: &Project) -> String {
-    let mut name = project
-        .name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    name.truncate(36);
-    format!("easy-ssh-{name}")
-}
-
-pub fn tmux_attach_command(project: &Project) -> String {
-    let workspace = shell_quote(&tmux_workspace(project));
-    format!(
-        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path} 'exec \"${{SHELL:-/bin/sh}}\" -l'; tmux set-option -t {workspace} status off; exec tmux attach-session -t {workspace}",
-        path = remote_path_target(&project.remote_path),
-    )
-}
-
-pub fn ghostty_args(project: &Project) -> Vec<String> {
+pub fn ghostty_args(project: &Project, agent: Agent) -> Vec<String> {
     vec![
         "-e".into(),
         "ssh".into(),
         "-tt".into(),
         project.ssh_target().into(),
-        tmux_attach_command(project),
+        remote_command(&project.remote_path, agent),
     ]
 }
 
-pub fn connect_with_terminal(project: &Project, terminal: TerminalMode) -> Result<()> {
+pub fn connect_with_terminal(
+    project: &Project,
+    terminal: TerminalMode,
+    agent: Agent,
+) -> Result<()> {
     match terminal {
-        TerminalMode::Current => connect(project),
+        TerminalMode::Current => connect(project, agent),
         TerminalMode::Ghostty => {
             let status = Command::new("ghostty")
-                .args(ghostty_args(project))
+                .args(ghostty_args(project, agent))
                 .status()
                 .context("failed to launch Ghostty; install Ghostty or use --terminal current")?;
             if status.success() {
@@ -277,35 +266,6 @@ pub fn connect_with_terminal(project: &Project, terminal: TerminalMode) -> Resul
                 anyhow::bail!("Ghostty exited with {status}")
             }
         }
-    }
-}
-
-pub fn create_tmux_window(project: &Project, label: &str) -> Result<String> {
-    let label = label.trim();
-    if label.is_empty() || label.contains('\n') || label.contains('\r') {
-        anyhow::bail!("session label cannot be empty or contain a newline");
-    }
-    let workspace = tmux_workspace(project);
-    let target = shell_quote(&format!("{workspace}:{label}"));
-    let remote = format!(
-        "command -v tmux >/dev/null 2>&1 || {{ echo 'easy-ssh: tmux is required for persistent Ghostty sessions. Install it on this host and try again.' >&2; exit 127; }}; tmux new-session -Ad -s {workspace} -c {path} 'exec \"${{SHELL:-/bin/sh}}\" -l'; tmux set-option -t {workspace} status off; tmux new-window -t {workspace}: -n {label} -c {path} 'exec \"${{SHELL:-/bin/sh}}\" -l'; tmux display-message -p -t {target} '#{{window_id}}'",
-        workspace = shell_quote(&workspace),
-        label = shell_quote(label),
-        path = remote_path_target(&project.remote_path),
-    );
-    let output = Command::new("ssh")
-        .args(["--", project.ssh_target(), &remote])
-        .output()
-        .context("failed to create remote tmux session")?;
-    if output.status.success() {
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .last()
-            .filter(|window_id| !window_id.is_empty())
-            .map(str::to_owned)
-            .context("remote tmux did not return a window ID")
-    } else {
-        anyhow::bail!("remote tmux setup exited with {}", output.status)
     }
 }
 
@@ -485,7 +445,7 @@ fn backup_once(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Connection;
+    use crate::model::{Agent, Connection};
     use crate::storage::AppPaths;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -494,6 +454,7 @@ mod tests {
         Project {
             name: "avarya".into(),
             remote_path: "~/work/A user's app".into(),
+            agent: Agent::Shell,
             connection: Connection::NewHost {
                 host: "server.example.com".into(),
                 user: Some("deploy".into()),
@@ -526,6 +487,7 @@ mod tests {
             projects: vec![Project {
                 name: "prod-app".into(),
                 remote_path: "/srv/app".into(),
+                agent: Agent::Shell,
                 connection: Connection::ExistingAlias {
                     ssh_alias: "production".into(),
                 },
@@ -541,21 +503,26 @@ mod tests {
 
     #[test]
     fn quotes_remote_paths_and_expands_home() {
-        let command = remote_command("~/work/A user's app");
+        let command = remote_command("~/work/A user's app", Agent::Shell);
         assert!(command.contains("\"$HOME\"/'work/A user'\"'\"'s app'"));
         assert!(command.contains("remote folder unavailable"));
         assert!(command.ends_with("exec \"${SHELL:-/bin/sh}\" -l"));
     }
 
     #[test]
-    fn ghostty_attaches_to_a_stable_tmux_workspace() {
+    fn ghostty_uses_the_plain_ssh_agent_command() {
         let project = new_project();
-        assert_eq!(tmux_workspace(&project), "easy-ssh-avarya");
-        let args = ghostty_args(&project);
+        let args = ghostty_args(&project, Agent::Codex);
         assert_eq!(args[..3], ["-e", "ssh", "-tt"]);
-        assert!(args.last().unwrap().contains("tmux new-session -Ad"));
-        assert!(args.last().unwrap().contains("status off"));
-        assert!(args.last().unwrap().contains("${SHELL:-/bin/sh}"));
+        assert!(args.last().unwrap().contains("codex resume --last"));
+        assert!(!args.last().unwrap().contains("tmux"));
+    }
+
+    #[test]
+    fn agents_resume_their_own_project_conversations() {
+        assert!(remote_command("~/work", Agent::Claude).contains("claude --continue"));
+        assert!(remote_command("~/work", Agent::Codex).contains("codex resume --last"));
+        assert!(!remote_command("~/work", Agent::Shell).contains("resume"));
     }
 
     #[test]

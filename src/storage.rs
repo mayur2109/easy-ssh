@@ -1,6 +1,5 @@
 use crate::model::{Project, ProjectFile};
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -12,7 +11,6 @@ pub struct AppPaths {
     pub home: PathBuf,
     pub config_dir: PathBuf,
     pub registry: PathBuf,
-    pub sessions: PathBuf,
     pub ssh_dir: PathBuf,
     pub ssh_config: PathBuf,
     pub managed_ssh_config: PathBuf,
@@ -36,7 +34,6 @@ impl AppPaths {
         let ssh_dir = home.join(".ssh");
         Self {
             registry: config_dir.join("projects.toml"),
-            sessions: config_dir.join("sessions.toml"),
             ssh_config: ssh_dir.join("config"),
             managed_ssh_config: ssh_dir.join("easy-ssh.conf"),
             bashrc: home.join(".bashrc"),
@@ -46,40 +43,6 @@ impl AppPaths {
             ssh_dir,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SessionRegistry {
-    #[serde(default)]
-    pub sessions: Vec<SessionRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionRecord {
-    pub project: String,
-    pub workspace: String,
-    pub window_id: String,
-    pub label: String,
-}
-
-pub fn record_session(paths: &AppPaths, record: SessionRecord) -> Result<()> {
-    let mut registry = if paths.sessions.exists() {
-        toml::from_str(&fs::read_to_string(&paths.sessions)?)
-            .with_context(|| format!("failed to parse {}", paths.sessions.display()))?
-    } else {
-        SessionRegistry::default()
-    };
-    registry
-        .sessions
-        .retain(|existing| existing.window_id != record.window_id);
-    registry.sessions.push(record);
-    registry.sessions.sort_by(|left, right| {
-        left.project
-            .cmp(&right.project)
-            .then(left.label.cmp(&right.label))
-    });
-    let contents = toml::to_string_pretty(&registry)?;
-    atomic_write(&paths.sessions, contents.as_bytes(), 0o600)
 }
 
 pub fn load(paths: &AppPaths) -> Result<ProjectFile> {
@@ -170,13 +133,14 @@ pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Connection;
+    use crate::model::{Agent, Connection};
     use tempfile::tempdir;
 
     fn project(name: &str) -> Project {
         Project {
             name: name.into(),
             remote_path: "/srv/app".into(),
+            agent: Agent::Shell,
             connection: Connection::ExistingAlias {
                 ssh_alias: "prod".into(),
             },

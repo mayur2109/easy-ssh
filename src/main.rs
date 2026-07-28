@@ -3,7 +3,7 @@ mod ssh;
 mod storage;
 mod tui;
 
-use crate::model::{Connection, Project, TerminalMode};
+use crate::model::{Agent, Connection, Project, TerminalMode};
 use crate::storage::AppPaths;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -44,11 +44,9 @@ enum Command {
         /// Terminal to use for this launch
         #[arg(long, value_enum)]
         terminal: Option<TerminalMode>,
-    },
-    /// Create a durable remote tmux session for a project
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
+        /// Agent to launch or resume for this connection
+        #[arg(long, value_enum)]
+        agent: Option<Agent>,
     },
     /// Check configuration and shell integration
     Doctor {
@@ -58,12 +56,6 @@ enum Command {
     },
     #[command(name = "__is-project", hide = true)]
     IsProject { name: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum SessionCommand {
-    /// Create a labelled tmux window and open the project workspace
-    New { name: String, label: String },
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +76,9 @@ struct AddArgs {
     /// Directory to enter on the remote machine
     #[arg(long)]
     path: String,
+    /// Default agent for this project
+    #[arg(long, value_enum, default_value_t = Agent::Shell)]
+    agent: Agent,
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +101,9 @@ struct EditArgs {
     identity: Option<PathBuf>,
     #[arg(long)]
     path: Option<String>,
+    /// Default agent for this project
+    #[arg(long, value_enum)]
+    agent: Option<Agent>,
 }
 
 fn main() {
@@ -126,7 +124,7 @@ fn run() -> Result<()> {
             tui::TuiExit::Connect(name) => {
                 let file = storage::load(&paths)?;
                 let project = find_project(&file, &name)?;
-                ssh::connect_with_terminal(project, file.settings.terminal)
+                ssh::connect_with_terminal(project, file.settings.terminal, project.agent)
             }
         },
         Some(Command::Install { shell }) => {
@@ -150,12 +148,16 @@ fn run() -> Result<()> {
                 println!("No projects configured.");
                 return Ok(());
             }
-            println!("{:<20} {:<32} REMOTE FOLDER", "PROJECT", "DESTINATION");
+            println!(
+                "{:<20} {:<32} {:<10} REMOTE FOLDER",
+                "PROJECT", "DESTINATION", "AGENT"
+            );
             for project in &file.projects {
                 println!(
-                    "{:<20} {:<32} {}",
+                    "{:<20} {:<32} {:<10} {}",
                     project.name,
                     project.destination(),
+                    project.agent.label(),
                     project.remote_path
                 );
             }
@@ -190,25 +192,17 @@ fn run() -> Result<()> {
             println!("Removed {name}");
             Ok(())
         }
-        Some(Command::Connect { name, terminal }) => {
-            let project = find_project(&file, &name)?;
-            ssh::connect_with_terminal(project, terminal.unwrap_or(file.settings.terminal))
-        }
-        Some(Command::Session {
-            command: SessionCommand::New { name, label },
+        Some(Command::Connect {
+            name,
+            terminal,
+            agent,
         }) => {
             let project = find_project(&file, &name)?;
-            let window_id = ssh::create_tmux_window(project, &label)?;
-            storage::record_session(
-                &paths,
-                storage::SessionRecord {
-                    project: project.name.clone(),
-                    workspace: ssh::tmux_workspace(project),
-                    window_id,
-                    label,
-                },
-            )?;
-            ssh::connect_with_terminal(project, TerminalMode::Ghostty)
+            ssh::connect_with_terminal(
+                project,
+                terminal.unwrap_or(file.settings.terminal),
+                agent.unwrap_or(project.agent),
+            )
         }
         Some(Command::Doctor { shell }) => {
             let shells = ssh::selected_shells(&shell)?;
@@ -245,6 +239,7 @@ fn project_from_add(args: AddArgs) -> Result<Project> {
     let project = Project {
         name: args.name,
         remote_path: args.path,
+        agent: args.agent,
         connection,
     };
     project.validate()?;
@@ -286,6 +281,7 @@ fn project_from_edit(file: &model::ProjectFile, args: &EditArgs) -> Result<Proje
     let project = Project {
         name: args.new_name.clone().unwrap_or(old.name),
         remote_path: args.path.clone().unwrap_or(old.remote_path),
+        agent: args.agent.unwrap_or(old.agent),
         connection,
     };
     project.validate()?;

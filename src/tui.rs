@@ -1,4 +1,4 @@
-use crate::model::{Connection, Project, ProjectFile, TerminalMode};
+use crate::model::{Agent, Connection, Project, ProjectFile, TerminalMode};
 use crate::ssh;
 use crate::storage::{self, AppPaths};
 use anyhow::Result;
@@ -113,6 +113,7 @@ struct ProjectForm {
     port: String,
     identity: String,
     remote_path: String,
+    agent: Agent,
     error: Option<String>,
     cursor: usize,
     suggestions: Vec<String>,
@@ -422,6 +423,10 @@ impl App {
             KeyCode::Left | KeyCode::Right if form.focus == 1 => {
                 form.toggle_mode();
                 form.cursor_to_end();
+                form.error = None;
+            }
+            KeyCode::Left | KeyCode::Right if form.focus == form.agent_focus() => {
+                form.cycle_agent(matches!(key.code, KeyCode::Right));
                 form.error = None;
             }
             KeyCode::Left if form.is_editable_focus() => {
@@ -774,7 +779,7 @@ impl App {
         frame.render_widget(Clear, area);
         let terminal = match self.projects.settings.terminal {
             TerminalMode::Current => "Current terminal",
-            TerminalMode::Ghostty => "Ghostty (persistent tmux workspace)",
+            TerminalMode::Ghostty => "Ghostty",
         };
         frame.render_widget(
             Paragraph::new(format!(
@@ -803,6 +808,7 @@ impl ProjectForm {
             port: String::new(),
             identity: String::new(),
             remote_path: String::new(),
+            agent: Agent::Shell,
             error: None,
             cursor: 0,
             suggestions: Vec::new(),
@@ -816,6 +822,7 @@ impl ProjectForm {
         form.original_name = Some(project.name.clone());
         form.name = project.name.clone();
         form.remote_path = project.remote_path.clone();
+        form.agent = project.agent;
         match &project.connection {
             Connection::NewHost {
                 host,
@@ -842,9 +849,9 @@ impl ProjectForm {
 
     fn field_count(&self) -> usize {
         if self.mode == ConnectionMode::New {
-            7
+            8
         } else {
-            4
+            5
         }
     }
 
@@ -863,6 +870,7 @@ impl ProjectForm {
                 ("Port (optional)", self.port.clone()),
                 ("Identity file (optional)", self.identity.clone()),
                 ("Remote folder", self.remote_path.clone()),
+                ("Agent", self.agent.label().into()),
             ]
         } else {
             vec![
@@ -870,6 +878,7 @@ impl ProjectForm {
                 ("Connection", mode.into()),
                 ("SSH alias", self.target.clone()),
                 ("Remote folder", self.remote_path.clone()),
+                ("Agent", self.agent.label().into()),
             ]
         }
     }
@@ -904,6 +913,7 @@ impl ProjectForm {
                 4 => &self.port,
                 5 => &self.identity,
                 6 => &self.remote_path,
+                7 => "",
                 _ => "",
             }
         } else {
@@ -911,6 +921,7 @@ impl ProjectForm {
                 0 => &self.name,
                 2 => &self.target,
                 3 => &self.remote_path,
+                4 => "",
                 _ => "",
             }
         }
@@ -986,6 +997,22 @@ impl ProjectForm {
         }
     }
 
+    fn agent_focus(&self) -> usize {
+        if self.mode == ConnectionMode::New {
+            7
+        } else {
+            4
+        }
+    }
+
+    fn cycle_agent(&mut self, forward: bool) {
+        self.agent = match (self.agent, forward) {
+            (Agent::Shell, true) | (Agent::Codex, false) => Agent::Claude,
+            (Agent::Claude, true) | (Agent::Shell, false) => Agent::Codex,
+            (Agent::Codex, true) | (Agent::Claude, false) => Agent::Shell,
+        };
+    }
+
     fn has_suggestions(&self) -> bool {
         !self.suggestions.is_empty()
     }
@@ -1025,14 +1052,16 @@ impl ProjectForm {
     }
 
     fn is_editable_focus(&self) -> bool {
-        self.focus != 1
+        self.focus != 1 && self.focus != self.agent_focus()
     }
 
     fn toggle_mode(&mut self) {
         self.focus = match (self.mode, self.focus) {
             (ConnectionMode::New, 6) => 3,
+            (ConnectionMode::New, 7) => 4,
             (ConnectionMode::New, 3..=5) => 2,
             (ConnectionMode::Existing, 3) => 6,
+            (ConnectionMode::Existing, 4) => 7,
             (_, focus) => focus,
         };
         self.mode = if self.mode == ConnectionMode::New {
@@ -1062,6 +1091,7 @@ impl ProjectForm {
         let project = Project {
             name: self.name.trim().to_owned(),
             remote_path: self.remote_path.trim().to_owned(),
+            agent: self.agent,
             connection,
         };
         project.validate()?;
@@ -1388,7 +1418,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("fields 7-7 of 7"));
+        assert!(rendered.contains("fields 7-7 of 8"));
         assert!(rendered.contains("> Remote folder"));
     }
 }

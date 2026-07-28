@@ -73,9 +73,10 @@ Other commands:
 ```bash
 easy-ssh list
 easy-ssh edit demo --path /srv/demo
+easy-ssh edit demo --agent claude
 easy-ssh connect demo
 easy-ssh connect demo --terminal ghostty
-easy-ssh session new demo codex-review
+easy-ssh connect demo --agent codex
 easy-ssh remove demo
 easy-ssh doctor
 easy-ssh doctor --shell bash --shell zsh
@@ -85,19 +86,18 @@ Projects are stored in
 `${XDG_CONFIG_HOME:-~/.config}/easy-ssh/projects.toml`. Passwords are never
 stored; OpenSSH continues to handle keys, agents, and password prompts.
 
-## Ghostty and persistent sessions
+## Ghostty and agent resume
 
 Press `s` in the TUI to choose Ghostty as the default terminal, or use the
-`--terminal ghostty` override above. Ghostty mode attaches to a remote tmux
-workspace for the project. Closing its window detaches without stopping Claude,
-Codex, or other work in that workspace; reconnecting restores every tmux window.
-Easy SSH starts the normal remote login shell inside that workspace and hides the
-tmux status bar, so the terminal experience matches a manual SSH session while
-the session remains durable.
+`--terminal ghostty` override above. Ghostty mode uses the same plain SSH and
+remote login-shell flow as a manual Ghostty connection.
 
-Use `easy-ssh session new <project> <label>` to create another labelled tmux
-window. tmux must already be installed on the remote host; Easy SSH never
-installs it automatically.
+Set a project's **Agent** in the TUI, or run `easy-ssh edit demo --agent
+claude` or `--agent codex`. On the next connection, Easy SSH asks that agent to
+resume its most recent conversation for the project folder. Closing Ghostty ends
+the terminal process; the next connection starts a fresh agent process with its
+saved conversation. Select **Shell** to always open only the normal remote
+shell.
 
 When adding or editing a project, Remote folder offers fuzzy directory matches
 at the typed path's current level. Up/Down selects a match, Tab inserts it, and
@@ -112,6 +112,6 @@ probes. This keeps healthy idle connections active and detects broken network
 links in about 90 seconds. Projects that use `--ssh-alias` keep the settings
 from the user's SSH config unchanged.
 
-Keepalive does not reconnect a dropped session or preserve programs running in
-the remote shell. Use a remote session manager such as `tmux` when work must
-survive a disconnect.
+Keepalive does not reconnect a dropped session or preserve arbitrary programs
+running in the remote shell. Claude and Codex projects resume their own saved
+conversations when Easy SSH reconnects; other programs end with the terminal.
