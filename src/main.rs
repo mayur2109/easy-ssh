@@ -3,7 +3,7 @@ mod ssh;
 mod storage;
 mod tui;
 
-use crate::model::{Connection, Project};
+use crate::model::{Connection, Project, TerminalMode};
 use crate::storage::AppPaths;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -39,7 +39,17 @@ enum Command {
         yes: bool,
     },
     /// Connect to a project
-    Connect { name: String },
+    Connect {
+        name: String,
+        /// Terminal to use for this launch
+        #[arg(long, value_enum)]
+        terminal: Option<TerminalMode>,
+    },
+    /// Create a durable remote tmux session for a project
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Check configuration and shell integration
     Doctor {
         /// Shell startup file to check; repeat to check both
@@ -48,6 +58,12 @@ enum Command {
     },
     #[command(name = "__is-project", hide = true)]
     IsProject { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// Create a labelled tmux window and open the project workspace
+    New { name: String, label: String },
 }
 
 #[derive(Debug, Args)]
@@ -110,7 +126,7 @@ fn run() -> Result<()> {
             tui::TuiExit::Connect(name) => {
                 let file = storage::load(&paths)?;
                 let project = find_project(&file, &name)?;
-                ssh::connect(project)
+                ssh::connect_with_terminal(project, file.settings.terminal)
             }
         },
         Some(Command::Install { shell }) => {
@@ -174,9 +190,25 @@ fn run() -> Result<()> {
             println!("Removed {name}");
             Ok(())
         }
-        Some(Command::Connect { name }) => {
+        Some(Command::Connect { name, terminal }) => {
             let project = find_project(&file, &name)?;
-            ssh::connect(project)
+            ssh::connect_with_terminal(project, terminal.unwrap_or(file.settings.terminal))
+        }
+        Some(Command::Session {
+            command: SessionCommand::New { name, label },
+        }) => {
+            let project = find_project(&file, &name)?;
+            let window_id = ssh::create_tmux_window(project, &label)?;
+            storage::record_session(
+                &paths,
+                storage::SessionRecord {
+                    project: project.name.clone(),
+                    workspace: ssh::tmux_workspace(project),
+                    window_id,
+                    label,
+                },
+            )?;
+            ssh::connect_with_terminal(project, TerminalMode::Ghostty)
         }
         Some(Command::Doctor { shell }) => {
             let shells = ssh::selected_shells(&shell)?;

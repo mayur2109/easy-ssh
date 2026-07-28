@@ -8,6 +8,8 @@ pub struct ProjectFile {
     pub version: u32,
     #[serde(default)]
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 impl Default for ProjectFile {
@@ -15,8 +17,23 @@ impl Default for ProjectFile {
         Self {
             version: default_version(),
             projects: Vec::new(),
+            settings: Settings::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Settings {
+    #[serde(default)]
+    pub terminal: TerminalMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalMode {
+    #[default]
+    Current,
+    Ghostty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +179,7 @@ mod tests {
                     identity_file: Some(PathBuf::from("~/.ssh/id_ed25519")),
                 },
             }],
+            settings: Settings::default(),
         };
         let encoded = toml::to_string_pretty(&file).unwrap();
         let decoded: ProjectFile = toml::from_str(&encoded).unwrap();
