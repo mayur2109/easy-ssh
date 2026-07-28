@@ -73,9 +73,12 @@ Other commands:
 ```bash
 easy-ssh list
 easy-ssh edit demo --path /srv/demo
-easy-ssh edit demo --agent claude
 easy-ssh connect demo
 easy-ssh connect demo --terminal ghostty
+easy-ssh session new demo feature-review --agent claude
+easy-ssh session list demo
+easy-ssh session open demo feature-review
+easy-ssh session open demo --all
 easy-ssh connect demo --agent codex
 easy-ssh remove demo
 easy-ssh doctor
@@ -86,18 +89,27 @@ Projects are stored in
 `${XDG_CONFIG_HOME:-~/.config}/easy-ssh/projects.toml`. Passwords are never
 stored; OpenSSH continues to handle keys, agents, and password prompts.
 
-## Ghostty and agent resume
+## Normal connections and agent sessions
 
 Press `s` in the TUI to choose Ghostty as the default terminal, or use the
 `--terminal ghostty` override above. Ghostty mode uses the same plain SSH and
 remote login-shell flow as a manual Ghostty connection.
 
-Set a project's **Agent** in the TUI, or run `easy-ssh edit demo --agent
-claude` or `--agent codex`. On the next connection, Easy SSH asks that agent to
-resume its most recent conversation for the project folder. Closing Ghostty ends
-the terminal process; the next connection starts a fresh agent process with its
-saved conversation. Select **Shell** to always open only the normal remote
-shell.
+`easy-ssh connect demo` always opens the normal project shell. It never uses
+tmux and closing Ghostty ends that connection exactly as it would after a manual
+SSH command.
+
+Persistent Claude and Codex work uses named remote tmux windows. Create one
+with `easy-ssh session new demo <name> --agent claude|codex`. Closing Ghostty
+detaches it; opening the session later returns to the same live agent window.
+When a saved session is no longer live, Easy SSH starts its saved agent
+conversation again (Claude resumes its stored ID; Codex opens its resume picker).
+tmux must be installed on the remote host for agent sessions only.
+
+In the Projects TUI, Enter opens the normal connection and Tab opens the
+selected project's session picker. There, Enter opens one session, `a` attaches
+the whole workspace, `n` creates a named Claude/Codex session, and `c` cycles
+the session's saved color.
 
 When adding or editing a project, Remote folder offers fuzzy directory matches
 at the typed path's current level. Up/Down selects a match, Tab inserts it, and
@@ -112,6 +124,5 @@ probes. This keeps healthy idle connections active and detects broken network
 links in about 90 seconds. Projects that use `--ssh-alias` keep the settings
 from the user's SSH config unchanged.
 
-Keepalive does not reconnect a dropped session or preserve arbitrary programs
-running in the remote shell. Claude and Codex projects resume their own saved
-conversations when Easy SSH reconnects; other programs end with the terminal.
+Keepalive does not reconnect a dropped normal shell or preserve arbitrary
+programs. Use named agent sessions when work must survive closing Ghostty.

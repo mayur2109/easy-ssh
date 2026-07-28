@@ -1,5 +1,6 @@
-use crate::model::{Project, ProjectFile};
+use crate::model::{Agent, Project, ProjectFile};
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -11,6 +12,7 @@ pub struct AppPaths {
     pub home: PathBuf,
     pub config_dir: PathBuf,
     pub registry: PathBuf,
+    pub sessions: PathBuf,
     pub ssh_dir: PathBuf,
     pub ssh_config: PathBuf,
     pub managed_ssh_config: PathBuf,
@@ -34,6 +36,7 @@ impl AppPaths {
         let ssh_dir = home.join(".ssh");
         Self {
             registry: config_dir.join("projects.toml"),
+            sessions: config_dir.join("sessions.toml"),
             ssh_config: ssh_dir.join("config"),
             managed_ssh_config: ssh_dir.join("easy-ssh.conf"),
             bashrc: home.join(".bashrc"),
@@ -43,6 +46,74 @@ impl AppPaths {
             ssh_dir,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionRegistry {
+    #[serde(default)]
+    pub sessions: Vec<SessionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub project: String,
+    pub agent: Agent,
+    pub id: String,
+    pub label: String,
+    pub workspace: String,
+    pub window: String,
+    #[serde(default = "default_color")]
+    pub color: String,
+}
+
+fn default_color() -> String {
+    "cyan".into()
+}
+
+pub fn load_sessions(paths: &AppPaths) -> Result<SessionRegistry> {
+    if !paths.sessions.exists() {
+        return Ok(SessionRegistry::default());
+    }
+    toml::from_str(&fs::read_to_string(&paths.sessions)?)
+        .with_context(|| format!("failed to parse {}", paths.sessions.display()))
+}
+
+pub fn save_sessions(paths: &AppPaths, registry: &SessionRegistry) -> Result<()> {
+    atomic_write(
+        &paths.sessions,
+        toml::to_string_pretty(registry)?.as_bytes(),
+        0o600,
+    )
+}
+
+pub fn record_session(paths: &AppPaths, record: SessionRecord) -> Result<()> {
+    let mut registry = load_sessions(paths)?;
+    registry
+        .sessions
+        .retain(|item| !(item.project == record.project && item.id == record.id));
+    registry.sessions.push(record);
+    registry
+        .sessions
+        .sort_by(|a, b| a.project.cmp(&b.project).then(a.label.cmp(&b.label)));
+    save_sessions(paths, &registry)
+}
+
+pub fn cycle_color(paths: &AppPaths, project: &str, id: &str) -> Result<String> {
+    const COLORS: [&str; 6] = ["cyan", "green", "yellow", "magenta", "blue", "red"];
+    let mut registry = load_sessions(paths)?;
+    let record = registry
+        .sessions
+        .iter_mut()
+        .find(|item| item.project == project && item.id == id)
+        .with_context(|| format!("session {id:?} does not exist"))?;
+    let index = COLORS
+        .iter()
+        .position(|color| *color == record.color)
+        .unwrap_or(0);
+    record.color = COLORS[(index + 1) % COLORS.len()].into();
+    let color = record.color.clone();
+    save_sessions(paths, &registry)?;
+    Ok(color)
 }
 
 pub fn load(paths: &AppPaths) -> Result<ProjectFile> {
@@ -133,14 +204,13 @@ pub fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Agent, Connection};
+    use crate::model::Connection;
     use tempfile::tempdir;
 
     fn project(name: &str) -> Project {
         Project {
             name: name.into(),
             remote_path: "/srv/app".into(),
-            agent: Agent::Shell,
             connection: Connection::ExistingAlias {
                 ssh_alias: "prod".into(),
             },

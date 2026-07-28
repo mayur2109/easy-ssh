@@ -39,8 +39,8 @@ pub enum TerminalMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Agent {
-    #[default]
     Shell,
+    #[default]
     Claude,
     Codex,
 }
@@ -59,8 +59,6 @@ impl Agent {
 pub struct Project {
     pub name: String,
     pub remote_path: String,
-    #[serde(default)]
-    pub agent: Agent,
     #[serde(flatten)]
     pub connection: Connection,
 }
@@ -193,7 +191,6 @@ mod tests {
             projects: vec![Project {
                 name: "avarya".into(),
                 remote_path: "~/src/avarya".into(),
-                agent: Agent::Claude,
                 connection: Connection::NewHost {
                     host: "server.example.com".into(),
                     user: Some("deploy".into()),
@@ -213,7 +210,6 @@ mod tests {
         let project = Project {
             name: "avarya".into(),
             remote_path: "/srv/app".into(),
-            agent: Agent::Shell,
             connection: Connection::NewHost {
                 host: "server.example.com".into(),
                 user: None,

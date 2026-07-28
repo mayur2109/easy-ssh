@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -48,6 +49,11 @@ enum Command {
         #[arg(long, value_enum)]
         agent: Option<Agent>,
     },
+    /// Manage persistent Claude and Codex tmux sessions
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Check configuration and shell integration
     Doctor {
         /// Shell startup file to check; repeat to check both
@@ -56,6 +62,28 @@ enum Command {
     },
     #[command(name = "__is-project", hide = true)]
     IsProject { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// List saved sessions for a project
+    List { name: String },
+    /// Create and open a named persistent agent session
+    New {
+        name: String,
+        label: String,
+        #[arg(long, value_enum, default_value_t = Agent::Claude)]
+        agent: Agent,
+    },
+    /// Open one saved session, or every active window in its workspace
+    Open {
+        name: String,
+        session: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_enum)]
+        terminal: Option<TerminalMode>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -76,9 +104,6 @@ struct AddArgs {
     /// Directory to enter on the remote machine
     #[arg(long)]
     path: String,
-    /// Default agent for this project
-    #[arg(long, value_enum, default_value_t = Agent::Shell)]
-    agent: Agent,
 }
 
 #[derive(Debug, Args)]
@@ -101,9 +126,6 @@ struct EditArgs {
     identity: Option<PathBuf>,
     #[arg(long)]
     path: Option<String>,
-    /// Default agent for this project
-    #[arg(long, value_enum)]
-    agent: Option<Agent>,
 }
 
 fn main() {
@@ -124,7 +146,34 @@ fn run() -> Result<()> {
             tui::TuiExit::Connect(name) => {
                 let file = storage::load(&paths)?;
                 let project = find_project(&file, &name)?;
-                ssh::connect_with_terminal(project, file.settings.terminal, project.agent)
+                ssh::connect_with_terminal(project, file.settings.terminal, Agent::Claude)
+            }
+            tui::TuiExit::OpenSession { project: name, id } => {
+                let file = storage::load(&paths)?;
+                let project = find_project(&file, &name)?;
+                let registry = storage::load_sessions(&paths)?;
+                let session = registry
+                    .sessions
+                    .iter()
+                    .find(|item| item.project == name && item.id == id)
+                    .with_context(|| format!("session {id:?} does not exist"))?;
+                open_saved_session(project, session, file.settings.terminal)
+            }
+            tui::TuiExit::OpenWorkspace(name) => {
+                let file = storage::load(&paths)?;
+                ssh::connect_workspace(find_project(&file, &name)?, file.settings.terminal)
+            }
+            tui::TuiExit::NewSession {
+                project: name,
+                label,
+                agent,
+            } => {
+                let file = storage::load(&paths)?;
+                let project = find_project(&file, &name)?;
+                let session =
+                    ssh::create_agent_session(project, agent, &Uuid::new_v4().to_string(), &label)?;
+                storage::record_session(&paths, session.clone())?;
+                ssh::connect_session(project, &session, file.settings.terminal)
             }
         },
         Some(Command::Install { shell }) => {
@@ -148,16 +197,12 @@ fn run() -> Result<()> {
                 println!("No projects configured.");
                 return Ok(());
             }
-            println!(
-                "{:<20} {:<32} {:<10} REMOTE FOLDER",
-                "PROJECT", "DESTINATION", "AGENT"
-            );
+            println!("{:<20} {:<32} REMOTE FOLDER", "PROJECT", "DESTINATION");
             for project in &file.projects {
                 println!(
-                    "{:<20} {:<32} {:<10} {}",
+                    "{:<20} {:<32} {}",
                     project.name,
                     project.destination(),
-                    project.agent.label(),
                     project.remote_path
                 );
             }
@@ -198,12 +243,14 @@ fn run() -> Result<()> {
             agent,
         }) => {
             let project = find_project(&file, &name)?;
-            ssh::connect_with_terminal(
-                project,
-                terminal.unwrap_or(file.settings.terminal),
-                agent.unwrap_or(project.agent),
-            )
+            let terminal = terminal.unwrap_or(file.settings.terminal);
+            if let Some(agent) = agent {
+                open_latest_agent_session(&paths, project, agent, terminal)
+            } else {
+                ssh::connect_with_terminal(project, terminal, Agent::Claude)
+            }
         }
+        Some(Command::Session { command }) => run_session_command(&paths, &file, command),
         Some(Command::Doctor { shell }) => {
             let shells = ssh::selected_shells(&shell)?;
             let checks = ssh::doctor(&paths, &file, &shells);
@@ -228,6 +275,99 @@ fn run() -> Result<()> {
     }
 }
 
+fn run_session_command(
+    paths: &AppPaths,
+    file: &model::ProjectFile,
+    command: SessionCommand,
+) -> Result<()> {
+    match command {
+        SessionCommand::List { name } => {
+            let project = find_project(file, &name)?;
+            let active = ssh::active_session_windows(project).unwrap_or_default();
+            let sessions = storage::load_sessions(paths)?;
+            for session in sessions
+                .sessions
+                .iter()
+                .filter(|item| item.project == project.name)
+            {
+                let state = if active.contains(&session.window) {
+                    "active"
+                } else {
+                    "saved"
+                };
+                println!(
+                    "{:<10} {:<8} {:<10} {}",
+                    session.label,
+                    session.agent.label(),
+                    state,
+                    session.color
+                );
+            }
+            Ok(())
+        }
+        SessionCommand::New { name, label, agent } => {
+            let project = find_project(file, &name)?;
+            let session =
+                ssh::create_agent_session(project, agent, &Uuid::new_v4().to_string(), &label)?;
+            storage::record_session(paths, session.clone())?;
+            ssh::connect_session(project, &session, file.settings.terminal)
+        }
+        SessionCommand::Open {
+            name,
+            session,
+            all,
+            terminal,
+        } => {
+            let project = find_project(file, &name)?;
+            let terminal = terminal.unwrap_or(file.settings.terminal);
+            if all {
+                return ssh::connect_workspace(project, terminal);
+            }
+            let selector = session.context("provide a session label or use --all")?;
+            let registry = storage::load_sessions(paths)?;
+            let record = registry
+                .sessions
+                .iter()
+                .find(|item| {
+                    item.project == project.name && (item.label == selector || item.id == selector)
+                })
+                .with_context(|| {
+                    format!(
+                        "session {selector:?} does not exist for project {:?}",
+                        project.name
+                    )
+                })?;
+            open_saved_session(project, record, terminal)
+        }
+    }
+}
+
+fn open_latest_agent_session(
+    paths: &AppPaths,
+    project: &Project,
+    agent: Agent,
+    terminal: TerminalMode,
+) -> Result<()> {
+    let registry = storage::load_sessions(paths)?;
+    let active = ssh::active_session_windows(project)?;
+    let record = registry.sessions.iter().rev().find(|item| item.project == project.name && item.agent == agent && active.contains(&item.window))
+        .with_context(|| format!("no active {} session for {}; create one with `easy-ssh session new {} <name> --agent {}`", agent.label(), project.name, project.name, agent.label().to_ascii_lowercase()))?;
+    ssh::connect_session(project, record, terminal)
+}
+
+fn open_saved_session(
+    project: &Project,
+    record: &storage::SessionRecord,
+    terminal: TerminalMode,
+) -> Result<()> {
+    if ssh::active_session_windows(project)?.contains(&record.window) {
+        ssh::connect_session(project, record, terminal)
+    } else {
+        ssh::resume_agent_session(project, record)?;
+        ssh::connect_session(project, record, terminal)
+    }
+}
+
 fn project_from_add(args: AddArgs) -> Result<Project> {
     let connection = connection_from_args(
         args.host,
@@ -239,7 +379,6 @@ fn project_from_add(args: AddArgs) -> Result<Project> {
     let project = Project {
         name: args.name,
         remote_path: args.path,
-        agent: args.agent,
         connection,
     };
     project.validate()?;
@@ -281,7 +420,6 @@ fn project_from_edit(file: &model::ProjectFile, args: &EditArgs) -> Result<Proje
     let project = Project {
         name: args.new_name.clone().unwrap_or(old.name),
         remote_path: args.path.clone().unwrap_or(old.remote_path),
-        agent: args.agent.unwrap_or(old.agent),
         connection,
     };
     project.validate()?;

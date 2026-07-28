@@ -1,6 +1,6 @@
 use crate::model::{Agent, Connection, Project, ProjectFile, TerminalMode};
 use crate::ssh;
-use crate::storage::{self, AppPaths};
+use crate::storage::{self, AppPaths, SessionRecord};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState, Wrap,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::Command;
@@ -30,6 +30,16 @@ const MUTED: Color = Color::DarkGray;
 pub enum TuiExit {
     Done,
     Connect(String),
+    OpenSession {
+        project: String,
+        id: String,
+    },
+    OpenWorkspace(String),
+    NewSession {
+        project: String,
+        label: String,
+        agent: Agent,
+    },
 }
 
 pub fn run(paths: &AppPaths, projects: ProjectFile) -> Result<TuiExit> {
@@ -94,7 +104,20 @@ enum Screen {
     Browse,
     Form(Box<ProjectForm>),
     ConfirmDelete,
-    Settings { original_terminal: TerminalMode },
+    Settings {
+        original_terminal: TerminalMode,
+    },
+    Sessions {
+        project: String,
+        sessions: Vec<SessionRecord>,
+        active: BTreeSet<String>,
+        selected: usize,
+    },
+    NewSession {
+        project: String,
+        label: String,
+        agent: Agent,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +136,6 @@ struct ProjectForm {
     port: String,
     identity: String,
     remote_path: String,
-    agent: Agent,
     error: Option<String>,
     cursor: usize,
     suggestions: Vec<String>,
@@ -196,6 +218,17 @@ impl App {
                 self.handle_settings(key, original_terminal)?;
                 Ok(None)
             }
+            Screen::Sessions {
+                project,
+                sessions,
+                active,
+                selected,
+            } => self.handle_sessions(key, project, sessions, active, selected),
+            Screen::NewSession {
+                project,
+                mut label,
+                mut agent,
+            } => self.handle_new_session(key, project, &mut label, &mut agent),
             Screen::Form(mut form) => {
                 if self.handle_form(key, &mut form)? {
                     self.screen = Screen::Browse;
@@ -310,7 +343,150 @@ impl App {
                     return Ok(Some(TuiExit::Connect(project.name.clone())));
                 }
             }
+            KeyCode::Tab => {
+                if let Some(project) = self.selected_project().cloned() {
+                    let sessions = storage::load_sessions(&self.paths)?
+                        .sessions
+                        .into_iter()
+                        .filter(|session| session.project == project.name)
+                        .collect();
+                    let active = ssh::active_session_windows(&project).unwrap_or_default();
+                    self.screen = Screen::Sessions {
+                        project: project.name,
+                        sessions,
+                        active,
+                        selected: 0,
+                    };
+                }
+            }
             _ => {}
+        }
+        Ok(None)
+    }
+
+    fn handle_sessions(
+        &mut self,
+        key: KeyEvent,
+        project: String,
+        mut sessions: Vec<SessionRecord>,
+        active: BTreeSet<String>,
+        mut selected: usize,
+    ) -> Result<Option<TuiExit>> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                self.screen = Screen::Browse;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                self.screen = Screen::Sessions {
+                    project,
+                    sessions,
+                    active,
+                    selected,
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') if selected + 1 < sessions.len() => {
+                selected += 1;
+                self.screen = Screen::Sessions {
+                    project,
+                    sessions,
+                    active,
+                    selected,
+                };
+            }
+            KeyCode::Char('a') => return Ok(Some(TuiExit::OpenWorkspace(project))),
+            KeyCode::Char('n') => {
+                self.screen = Screen::NewSession {
+                    project,
+                    label: String::new(),
+                    agent: Agent::Claude,
+                };
+            }
+            KeyCode::Char('c') => {
+                if let Some(session) = sessions.get_mut(selected) {
+                    session.color = storage::cycle_color(&self.paths, &project, &session.id)?;
+                    if let Some(project_config) = self
+                        .projects
+                        .projects
+                        .iter()
+                        .find(|item| item.name == project)
+                    {
+                        let _ = ssh::set_session_color(project_config, session, &session.color);
+                    }
+                }
+                self.screen = Screen::Sessions {
+                    project,
+                    sessions,
+                    active,
+                    selected,
+                };
+            }
+            KeyCode::Enter => {
+                if let Some(session) = sessions.get(selected) {
+                    return Ok(Some(TuiExit::OpenSession {
+                        project,
+                        id: session.id.clone(),
+                    }));
+                }
+            }
+            _ => {
+                self.screen = Screen::Sessions {
+                    project,
+                    sessions,
+                    active,
+                    selected,
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn handle_new_session(
+        &mut self,
+        key: KeyEvent,
+        project: String,
+        label: &mut String,
+        agent: &mut Agent,
+    ) -> Result<Option<TuiExit>> {
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Browse,
+            KeyCode::Enter if !label.trim().is_empty() => {
+                return Ok(Some(TuiExit::NewSession {
+                    project,
+                    label: label.trim().into(),
+                    agent: *agent,
+                }));
+            }
+            KeyCode::Left | KeyCode::Right => {
+                *agent = if *agent == Agent::Claude {
+                    Agent::Codex
+                } else {
+                    Agent::Claude
+                }
+            }
+            KeyCode::Backspace => {
+                label.pop();
+                self.screen = Screen::NewSession {
+                    project,
+                    label: label.clone(),
+                    agent: *agent,
+                };
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                label.push(character);
+                self.screen = Screen::NewSession {
+                    project,
+                    label: label.clone(),
+                    agent: *agent,
+                };
+            }
+            _ => {
+                self.screen = Screen::NewSession {
+                    project,
+                    label: label.clone(),
+                    agent: *agent,
+                }
+            }
         }
         Ok(None)
     }
@@ -423,10 +599,6 @@ impl App {
             KeyCode::Left | KeyCode::Right if form.focus == 1 => {
                 form.toggle_mode();
                 form.cursor_to_end();
-                form.error = None;
-            }
-            KeyCode::Left | KeyCode::Right if form.focus == form.agent_focus() => {
-                form.cycle_agent(matches!(key.code, KeyCode::Right));
                 form.error = None;
             }
             KeyCode::Left if form.is_editable_focus() => {
@@ -552,6 +724,17 @@ impl App {
             Screen::Form(form) => self.draw_form(frame, form),
             Screen::ConfirmDelete => self.draw_delete_confirmation(frame),
             Screen::Settings { .. } => self.draw_settings(frame),
+            Screen::Sessions {
+                project,
+                sessions,
+                active,
+                selected,
+            } => self.draw_sessions(frame, project, sessions, active, *selected),
+            Screen::NewSession {
+                project,
+                label,
+                agent,
+            } => self.draw_new_session(frame, project, label, *agent),
             Screen::Browse => {}
         }
     }
@@ -794,6 +977,94 @@ impl App {
             area,
         );
     }
+
+    fn draw_sessions(
+        &self,
+        frame: &mut ratatui::Frame,
+        project: &str,
+        sessions: &[SessionRecord],
+        active: &BTreeSet<String>,
+        selected: usize,
+    ) {
+        let area = centered_rect(
+            72.min(frame.area().width),
+            12.min(frame.area().height),
+            frame.area(),
+        );
+        frame.render_widget(Clear, area);
+        let items = if sessions.is_empty() {
+            vec![ListItem::new(
+                "No saved Claude or Codex sessions. Press n to create one.",
+            )]
+        } else {
+            sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    let state = if active.contains(&session.window) {
+                        "active"
+                    } else {
+                        "saved"
+                    };
+                    let prefix = if index == selected { "› " } else { "  " };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!(
+                            "{prefix}{:<18} {:<7} {:<7} ",
+                            session.label,
+                            session.agent.label(),
+                            state
+                        )),
+                        Span::styled(
+                            session.color.clone(),
+                            Style::default().fg(session_color(&session.color)),
+                        ),
+                    ]))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .title(format!(" {project} sessions "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT)),
+            ),
+            area,
+        );
+        let help = "Enter open   a open all   n new   c color   Tab/Esc close";
+        frame.render_widget(
+            Paragraph::new(help).style(Style::default().fg(MUTED)),
+            Rect {
+                x: area.x + 2,
+                y: area.bottom().saturating_sub(2),
+                width: area.width.saturating_sub(4),
+                height: 1,
+            },
+        );
+    }
+
+    fn draw_new_session(
+        &self,
+        frame: &mut ratatui::Frame,
+        project: &str,
+        label: &str,
+        agent: Agent,
+    ) {
+        let area = centered_rect(58.min(frame.area().width), 7, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(format!("Project: {project}\nName: {label}_\nAgent: {}  (Left/Right changes)\n\nEnter create   Esc cancel", agent.label())).block(Block::default().title(" New agent session ").borders(Borders::ALL).border_style(Style::default().fg(ACCENT))), area);
+    }
+}
+
+fn session_color(color: &str) -> Color {
+    match color {
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "magenta" => Color::Magenta,
+        "blue" => Color::Blue,
+        "red" => Color::Red,
+        _ => Color::Cyan,
+    }
 }
 
 impl ProjectForm {
@@ -808,7 +1079,6 @@ impl ProjectForm {
             port: String::new(),
             identity: String::new(),
             remote_path: String::new(),
-            agent: Agent::Shell,
             error: None,
             cursor: 0,
             suggestions: Vec::new(),
@@ -822,7 +1092,6 @@ impl ProjectForm {
         form.original_name = Some(project.name.clone());
         form.name = project.name.clone();
         form.remote_path = project.remote_path.clone();
-        form.agent = project.agent;
         match &project.connection {
             Connection::NewHost {
                 host,
@@ -849,9 +1118,9 @@ impl ProjectForm {
 
     fn field_count(&self) -> usize {
         if self.mode == ConnectionMode::New {
-            8
+            7
         } else {
-            5
+            4
         }
     }
 
@@ -870,7 +1139,6 @@ impl ProjectForm {
                 ("Port (optional)", self.port.clone()),
                 ("Identity file (optional)", self.identity.clone()),
                 ("Remote folder", self.remote_path.clone()),
-                ("Agent", self.agent.label().into()),
             ]
         } else {
             vec![
@@ -878,7 +1146,6 @@ impl ProjectForm {
                 ("Connection", mode.into()),
                 ("SSH alias", self.target.clone()),
                 ("Remote folder", self.remote_path.clone()),
-                ("Agent", self.agent.label().into()),
             ]
         }
     }
@@ -913,7 +1180,6 @@ impl ProjectForm {
                 4 => &self.port,
                 5 => &self.identity,
                 6 => &self.remote_path,
-                7 => "",
                 _ => "",
             }
         } else {
@@ -921,7 +1187,6 @@ impl ProjectForm {
                 0 => &self.name,
                 2 => &self.target,
                 3 => &self.remote_path,
-                4 => "",
                 _ => "",
             }
         }
@@ -997,22 +1262,6 @@ impl ProjectForm {
         }
     }
 
-    fn agent_focus(&self) -> usize {
-        if self.mode == ConnectionMode::New {
-            7
-        } else {
-            4
-        }
-    }
-
-    fn cycle_agent(&mut self, forward: bool) {
-        self.agent = match (self.agent, forward) {
-            (Agent::Shell, true) | (Agent::Codex, false) => Agent::Claude,
-            (Agent::Claude, true) | (Agent::Shell, false) => Agent::Codex,
-            (Agent::Codex, true) | (Agent::Claude, false) => Agent::Shell,
-        };
-    }
-
     fn has_suggestions(&self) -> bool {
         !self.suggestions.is_empty()
     }
@@ -1052,16 +1301,14 @@ impl ProjectForm {
     }
 
     fn is_editable_focus(&self) -> bool {
-        self.focus != 1 && self.focus != self.agent_focus()
+        self.focus != 1
     }
 
     fn toggle_mode(&mut self) {
         self.focus = match (self.mode, self.focus) {
             (ConnectionMode::New, 6) => 3,
-            (ConnectionMode::New, 7) => 4,
             (ConnectionMode::New, 3..=5) => 2,
             (ConnectionMode::Existing, 3) => 6,
-            (ConnectionMode::Existing, 4) => 7,
             (_, focus) => focus,
         };
         self.mode = if self.mode == ConnectionMode::New {
@@ -1091,7 +1338,6 @@ impl ProjectForm {
         let project = Project {
             name: self.name.trim().to_owned(),
             remote_path: self.remote_path.trim().to_owned(),
-            agent: self.agent,
             connection,
         };
         project.validate()?;
@@ -1418,7 +1664,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("fields 7-7 of 8"));
+        assert!(rendered.contains("fields 7-7 of 7"));
         assert!(rendered.contains("> Remote folder"));
     }
 }
