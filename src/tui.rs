@@ -1,4 +1,4 @@
-use crate::model::{Connection, Project, ProjectFile};
+use crate::model::{Connection, Project, ProjectFile, TerminalMode};
 use crate::ssh;
 use crate::storage::{self, AppPaths};
 use anyhow::Result;
@@ -18,6 +18,9 @@ use ratatui::widgets::{
 };
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::Duration;
 
 const ACCENT: Color = Color::Cyan;
@@ -72,16 +75,21 @@ struct App {
     projects: ProjectFile,
     selected: usize,
     query: String,
+    query_cursor: usize,
     searching: bool,
     screen: Screen,
     status: Option<(bool, String)>,
     aliases: Vec<String>,
+    path_lookup_tx: Sender<PathLookup>,
+    path_lookup_rx: Receiver<PathLookup>,
+    next_path_request: u64,
 }
 
 enum Screen {
     Browse,
     Form(Box<ProjectForm>),
     ConfirmDelete,
+    Settings { original_terminal: TerminalMode },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,21 +109,34 @@ struct ProjectForm {
     identity: String,
     remote_path: String,
     error: Option<String>,
-    alias_index: usize,
+    cursor: usize,
+    suggestions: Vec<String>,
+    suggestion_index: usize,
+    path_request: u64,
+}
+
+struct PathLookup {
+    request: u64,
+    result: Result<Vec<String>, String>,
 }
 
 impl App {
     fn new(paths: AppPaths, projects: ProjectFile) -> Self {
         let aliases = ssh::discover_aliases(&paths);
+        let (path_lookup_tx, path_lookup_rx) = mpsc::channel();
         Self {
             paths,
             projects,
             selected: 0,
             query: String::new(),
+            query_cursor: 0,
             searching: false,
             screen: Screen::Browse,
             status: None,
             aliases,
+            path_lookup_tx,
+            path_lookup_rx,
+            next_path_request: 0,
         }
     }
 
@@ -142,6 +163,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<Option<TuiExit>> {
+        self.receive_path_lookups();
         let screen = std::mem::replace(&mut self.screen, Screen::Browse);
         match screen {
             Screen::Browse => {
@@ -150,6 +172,10 @@ impl App {
             }
             Screen::ConfirmDelete => {
                 self.handle_delete_confirmation(key)?;
+                Ok(None)
+            }
+            Screen::Settings { original_terminal } => {
+                self.handle_settings(key, original_terminal)?;
                 Ok(None)
             }
             Screen::Form(mut form) => {
@@ -168,11 +194,45 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.searching = false,
                 KeyCode::Backspace => {
-                    self.query.pop();
+                    if self.query_cursor > 0 {
+                        let start = self.query[..self.query_cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(index, _)| index)
+                            .unwrap_or(0);
+                        self.query.drain(start..self.query_cursor);
+                        self.query_cursor = start;
+                    }
                     self.selected = 0;
                 }
+                KeyCode::Delete => {
+                    let end = self.query[self.query_cursor..]
+                        .chars()
+                        .next()
+                        .map(|character| self.query_cursor + character.len_utf8())
+                        .unwrap_or(self.query_cursor);
+                    self.query.drain(self.query_cursor..end);
+                    self.selected = 0;
+                }
+                KeyCode::Left => {
+                    self.query_cursor = self.query[..self.query_cursor]
+                        .char_indices()
+                        .last()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                }
+                KeyCode::Right => {
+                    self.query_cursor = self.query[self.query_cursor..]
+                        .chars()
+                        .next()
+                        .map(|character| self.query_cursor + character.len_utf8())
+                        .unwrap_or(self.query.len());
+                }
+                KeyCode::Home => self.query_cursor = 0,
+                KeyCode::End => self.query_cursor = self.query.len(),
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.query.push(character);
+                    self.query.insert(self.query_cursor, character);
+                    self.query_cursor += character.len_utf8();
                     self.selected = 0;
                 }
                 _ => {}
@@ -183,7 +243,10 @@ impl App {
         let visible_len = self.visible_indices().len();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(Some(TuiExit::Done)),
-            KeyCode::Char('/') => self.searching = true,
+            KeyCode::Char('/') => {
+                self.searching = true;
+                self.query_cursor = self.query.len();
+            }
             KeyCode::Char('a') => self.screen = Screen::Form(Box::new(ProjectForm::new())),
             KeyCode::Char('e') => {
                 if let Some(project) = self.selected_project().cloned() {
@@ -208,6 +271,11 @@ impl App {
                 }
                 Err(error) => self.status = Some((false, error.to_string())),
             },
+            KeyCode::Char('s') => {
+                self.screen = Screen::Settings {
+                    original_terminal: self.projects.settings.terminal,
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -222,6 +290,28 @@ impl App {
             _ => {}
         }
         Ok(None)
+    }
+
+    fn handle_settings(&mut self, key: KeyEvent, original_terminal: TerminalMode) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.projects.settings.terminal = original_terminal;
+                self.screen = Screen::Browse;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                self.projects.settings.terminal = match self.projects.settings.terminal {
+                    TerminalMode::Current => TerminalMode::Ghostty,
+                    TerminalMode::Ghostty => TerminalMode::Current,
+                };
+            }
+            KeyCode::Enter => {
+                storage::save(&self.paths, &self.projects)?;
+                self.status = Some((true, "Terminal preference saved".into()));
+                self.screen = Screen::Browse;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn handle_delete_confirmation(&mut self, key: KeyEvent) -> Result<()> {
@@ -280,39 +370,98 @@ impl App {
                 Err(error) => form.error = Some(error.to_string()),
             },
             KeyCode::Tab | KeyCode::Down => {
-                form.focus = (form.focus + 1) % form.field_count();
+                if form.has_suggestions() && matches!(key.code, KeyCode::Down) {
+                    form.select_suggestion(true);
+                } else if matches!(key.code, KeyCode::Tab) && form.has_suggestions() {
+                    form.accept_suggestion();
+                } else {
+                    form.focus = (form.focus + 1) % form.field_count();
+                    form.cursor_to_end();
+                }
                 form.error = None;
             }
             KeyCode::BackTab | KeyCode::Up => {
-                form.focus = form
-                    .focus
-                    .checked_sub(1)
-                    .unwrap_or_else(|| form.field_count() - 1);
+                if form.has_suggestions() && matches!(key.code, KeyCode::Up) {
+                    form.select_suggestion(false);
+                } else {
+                    form.focus = form
+                        .focus
+                        .checked_sub(1)
+                        .unwrap_or_else(|| form.field_count() - 1);
+                    form.cursor_to_end();
+                }
                 form.error = None;
             }
             KeyCode::Left | KeyCode::Right if form.focus == 1 => {
                 form.toggle_mode();
+                form.cursor_to_end();
                 form.error = None;
             }
-            KeyCode::Left if form.mode == ConnectionMode::Existing && form.focus == 2 => {
-                form.cycle_alias(&self.aliases, false);
+            KeyCode::Left if form.is_editable_focus() => {
+                form.move_cursor_left();
             }
-            KeyCode::Right if form.mode == ConnectionMode::Existing && form.focus == 2 => {
-                form.cycle_alias(&self.aliases, true);
+            KeyCode::Right if form.is_editable_focus() => {
+                form.move_cursor_right();
+            }
+            KeyCode::Home if form.is_editable_focus() => form.cursor = 0,
+            KeyCode::End if form.is_editable_focus() => form.cursor_to_end(),
+            KeyCode::Delete if form.is_editable_focus() => {
+                form.delete_at_cursor();
+                self.request_path_suggestions(form);
             }
             KeyCode::Backspace if form.is_editable_focus() => {
-                form.current_value_mut().pop();
+                form.backspace();
+                self.request_path_suggestions(form);
                 form.error = None;
             }
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::CONTROL) && form.is_editable_focus() =>
             {
-                form.current_value_mut().push(character);
+                form.insert(character);
+                self.request_path_suggestions(form);
                 form.error = None;
             }
             _ => {}
         }
         Ok(false)
+    }
+
+    fn receive_path_lookups(&mut self) {
+        while let Ok(lookup) = self.path_lookup_rx.try_recv() {
+            let Screen::Form(form) = &mut self.screen else {
+                continue;
+            };
+            if lookup.request != form.path_request {
+                continue;
+            }
+            match lookup.result {
+                Ok(suggestions) => {
+                    form.suggestions = suggestions;
+                    form.suggestion_index = 0;
+                }
+                Err(error) => {
+                    form.suggestions.clear();
+                    form.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn request_path_suggestions(&mut self, form: &mut ProjectForm) {
+        if form.focus != form.remote_path_focus() || form.remote_path.trim().is_empty() {
+            form.suggestions.clear();
+            return;
+        }
+        self.next_path_request += 1;
+        form.path_request = self.next_path_request;
+        let request = form.path_request;
+        let path = form.remote_path.clone();
+        let connection = form.connection_for_lookup();
+        let sender = self.path_lookup_tx.clone();
+        thread::spawn(move || {
+            let result = lookup_remote_paths(connection, &path);
+            let _ = sender.send(PathLookup { request, result });
+        });
     }
 
     fn draw(&self, frame: &mut ratatui::Frame) {
@@ -343,11 +492,16 @@ impl App {
 
         self.draw_table(frame, chunks[1]);
         let footer = if self.searching {
-            format!("Search: {}_", self.query)
+            format!(
+                "Search: {}_{}",
+                &self.query[..self.query_cursor],
+                &self.query[self.query_cursor..]
+            )
         } else if let Some((ok, message)) = &self.status {
             format!("{} {message}", if *ok { "OK" } else { "Error:" })
         } else {
-            "Enter connect   a add   e edit   d delete   / search   i install   q quit".into()
+            "Enter connect   a add   e edit   d delete   / search   i install   s settings   q quit"
+                .into()
         };
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(MUTED)),
@@ -357,6 +511,7 @@ impl App {
         match &self.screen {
             Screen::Form(form) => self.draw_form(frame, form),
             Screen::ConfirmDelete => self.draw_delete_confirmation(frame),
+            Screen::Settings { .. } => self.draw_settings(frame),
             Screen::Browse => {}
         }
     }
@@ -471,7 +626,8 @@ impl App {
                 format!(" {label} ")
             };
             let input_width = row.width.saturating_sub(2);
-            let (scroll, cursor_column) = input_view(value, input_width);
+            let (scroll, cursor_column) =
+                input_view(value, form.cursor_for(field_index), input_width);
             let value_style = if focused {
                 Style::default()
                     .fg(Color::White)
@@ -494,6 +650,42 @@ impl App {
             if focused && form.is_editable_focus() && input_width > 0 {
                 frame.set_cursor_position(Position::new(row.x + 1 + cursor_column, row.y + 1));
             }
+        }
+        if form.focus == form.remote_path_focus() && form.has_suggestions() {
+            let suggestion_height = (form.suggestions.len().min(6) as u16) + 2;
+            let suggestion_area = Rect {
+                x: area.x.saturating_add(2),
+                y: area.y.saturating_add(area.height.saturating_sub(2)),
+                width: area.width.saturating_sub(4),
+                height: suggestion_height.min(
+                    frame
+                        .area()
+                        .bottom()
+                        .saturating_sub(area.y + area.height.saturating_sub(2)),
+                ),
+            };
+            let items = form
+                .suggestions
+                .iter()
+                .enumerate()
+                .take(6)
+                .map(|(index, path)| {
+                    let prefix = if index == form.suggestion_index {
+                        "› "
+                    } else {
+                        "  "
+                    };
+                    ListItem::new(format!("{prefix}{path}"))
+                });
+            frame.render_widget(
+                List::new(items).block(
+                    Block::default()
+                        .title(" Remote matches ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
+                suggestion_area,
+            );
         }
         let focused_label = fields[form.focus].0;
         let help = form
@@ -536,6 +728,27 @@ impl App {
             area,
         );
     }
+
+    fn draw_settings(&self, frame: &mut ratatui::Frame) {
+        let area = centered_rect(58.min(frame.area().width), 7, frame.area());
+        frame.render_widget(Clear, area);
+        let terminal = match self.projects.settings.terminal {
+            TerminalMode::Current => "Current terminal",
+            TerminalMode::Ghostty => "Ghostty (persistent tmux workspace)",
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Default terminal: {terminal}\n\nLeft/Right/Space change   Enter save   Esc cancel"
+            ))
+            .block(
+                Block::default()
+                    .title(" Settings ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT)),
+            ),
+            area,
+        );
+    }
 }
 
 impl ProjectForm {
@@ -551,7 +764,10 @@ impl ProjectForm {
             identity: String::new(),
             remote_path: String::new(),
             error: None,
-            alias_index: 0,
+            cursor: 0,
+            suggestions: Vec::new(),
+            suggestion_index: 0,
+            path_request: 0,
         }
     }
 
@@ -580,6 +796,7 @@ impl ProjectForm {
                 form.target = ssh_alias.clone();
             }
         }
+        form.cursor_to_end();
         form
     }
 
@@ -638,6 +855,135 @@ impl ProjectForm {
         }
     }
 
+    fn current_value(&self) -> &str {
+        if self.mode == ConnectionMode::New {
+            match self.focus {
+                0 => &self.name,
+                2 => &self.target,
+                3 => &self.user,
+                4 => &self.port,
+                5 => &self.identity,
+                6 => &self.remote_path,
+                _ => "",
+            }
+        } else {
+            match self.focus {
+                0 => &self.name,
+                2 => &self.target,
+                3 => &self.remote_path,
+                _ => "",
+            }
+        }
+    }
+
+    fn cursor_for(&self, field_index: usize) -> usize {
+        if field_index == self.focus && self.is_editable_focus() {
+            self.cursor
+        } else {
+            0
+        }
+    }
+
+    fn cursor_to_end(&mut self) {
+        self.cursor = self.current_value().len();
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.current_value()[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    fn move_cursor_right(&mut self) {
+        let value = self.current_value();
+        self.cursor = value[self.cursor..]
+            .chars()
+            .next()
+            .map(|character| self.cursor + character.len_utf8())
+            .unwrap_or(value.len());
+    }
+
+    fn insert(&mut self, character: char) {
+        let cursor = self.cursor;
+        self.current_value_mut().insert(cursor, character);
+        self.cursor += character.len_utf8();
+        self.suggestions.clear();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.move_cursor_left();
+        let cursor = self.cursor;
+        let end = self.current_value()[cursor..]
+            .chars()
+            .next()
+            .map(|character| cursor + character.len_utf8())
+            .unwrap_or(cursor);
+        self.current_value_mut().drain(cursor..end);
+        self.suggestions.clear();
+    }
+
+    fn delete_at_cursor(&mut self) {
+        let cursor = self.cursor;
+        let end = self.current_value()[cursor..]
+            .chars()
+            .next()
+            .map(|character| cursor + character.len_utf8())
+            .unwrap_or(cursor);
+        self.current_value_mut().drain(cursor..end);
+        self.suggestions.clear();
+    }
+
+    fn remote_path_focus(&self) -> usize {
+        if self.mode == ConnectionMode::New {
+            6
+        } else {
+            3
+        }
+    }
+
+    fn has_suggestions(&self) -> bool {
+        !self.suggestions.is_empty()
+    }
+
+    fn select_suggestion(&mut self, forward: bool) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        self.suggestion_index = if forward {
+            (self.suggestion_index + 1) % self.suggestions.len()
+        } else {
+            self.suggestion_index
+                .checked_sub(1)
+                .unwrap_or(self.suggestions.len() - 1)
+        };
+    }
+
+    fn accept_suggestion(&mut self) {
+        if let Some(path) = self.suggestions.get(self.suggestion_index).cloned() {
+            self.remote_path = path;
+            self.focus = self.remote_path_focus();
+            self.cursor_to_end();
+        }
+        self.suggestions.clear();
+    }
+
+    fn connection_for_lookup(&self) -> LookupConnection {
+        match self.mode {
+            ConnectionMode::Existing => LookupConnection::Alias(self.target.trim().to_owned()),
+            ConnectionMode::New => LookupConnection::NewHost {
+                host: self.target.trim().to_owned(),
+                user: optional_string(&self.user),
+                port: self.port.trim().parse().ok(),
+                identity: optional_string(&self.identity),
+            },
+        }
+    }
+
     fn is_editable_focus(&self) -> bool {
         self.focus != 1
     }
@@ -654,21 +1000,6 @@ impl ProjectForm {
         } else {
             ConnectionMode::New
         };
-    }
-
-    fn cycle_alias(&mut self, aliases: &[String], forward: bool) {
-        if aliases.is_empty() {
-            return;
-        }
-        if let Some(index) = aliases.iter().position(|alias| alias == &self.target) {
-            self.alias_index = index;
-        }
-        self.alias_index = if forward {
-            (self.alias_index + 1) % aliases.len()
-        } else {
-            self.alias_index.checked_sub(1).unwrap_or(aliases.len() - 1)
-        };
-        self.target.clone_from(&aliases[self.alias_index]);
     }
 
     fn to_project(&self) -> Result<Project> {
@@ -703,17 +1034,122 @@ fn optional_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-fn input_view(value: &str, width: u16) -> (u16, u16) {
+fn input_view(value: &str, cursor: usize, width: u16) -> (u16, u16) {
     if width == 0 {
         return (0, 0);
     }
-    let text_width = Line::from(value).width();
+    let cursor_width = Line::from(&value[..cursor]).width();
     let cursor_limit = usize::from(width.saturating_sub(1));
-    let scroll = text_width.saturating_sub(cursor_limit);
+    let scroll = cursor_width.saturating_sub(cursor_limit);
     (
         scroll.min(usize::from(u16::MAX)) as u16,
-        text_width.saturating_sub(scroll).min(cursor_limit) as u16,
+        cursor_width.saturating_sub(scroll).min(cursor_limit) as u16,
     )
+}
+
+#[derive(Clone)]
+enum LookupConnection {
+    Alias(String),
+    NewHost {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        identity: Option<String>,
+    },
+}
+
+fn lookup_remote_paths(
+    connection: LookupConnection,
+    typed_path: &str,
+) -> Result<Vec<String>, String> {
+    let (parent, fragment) = split_path_query(typed_path);
+    let mut command = Command::new("ssh");
+    match connection {
+        LookupConnection::Alias(alias) => {
+            if alias.is_empty() {
+                return Ok(Vec::new());
+            }
+            command.arg("--").arg(alias);
+        }
+        LookupConnection::NewHost {
+            host,
+            user,
+            port,
+            identity,
+        } => {
+            if host.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(port) = port {
+                command.args(["-p", &port.to_string()]);
+            }
+            if let Some(identity) = identity {
+                command.args(["-i", &identity]);
+            }
+            let target = user.map(|user| format!("{user}@{host}")).unwrap_or(host);
+            command.arg("--").arg(target);
+        }
+    }
+    let remote = format!(
+        "p={}; case \"$p\" in '~') p=\"$HOME\";; '~/'*) p=\"$HOME/${{p#~/}}\";; esac; if [ -d \"$p\" ]; then find \"$p\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null; fi",
+        shell_quote_for_remote(&parent)
+    );
+    let output = command
+        .arg(remote)
+        .output()
+        .map_err(|error| format!("path lookup failed: {error}"))?;
+    if !output.status.success() {
+        return Err("path lookup failed on remote host".into());
+    }
+    let mut results = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|name| format_path_candidate(&parent, name))
+        .filter(|candidate| fuzzy_matches(candidate, typed_path, &fragment))
+        .collect::<Vec<_>>();
+    results.sort_by_key(|candidate| fuzzy_score(candidate, typed_path));
+    Ok(results)
+}
+
+fn split_path_query(value: &str) -> (String, String) {
+    let trimmed = value.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((parent, fragment)) if parent.is_empty() => ("/".into(), fragment.into()),
+        Some((parent, fragment)) => (parent.into(), fragment.into()),
+        None => (".".into(), trimmed.into()),
+    }
+}
+
+fn format_path_candidate(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else if parent == "." {
+        name.into()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn fuzzy_matches(candidate: &str, typed: &str, fragment: &str) -> bool {
+    let needle = if fragment.is_empty() { typed } else { fragment }.to_ascii_lowercase();
+    let mut chars = needle.chars();
+    let mut next = chars.next();
+    for character in candidate.to_ascii_lowercase().chars() {
+        if Some(character) == next {
+            next = chars.next();
+        }
+    }
+    next.is_none()
+}
+
+fn fuzzy_score(candidate: &str, typed: &str) -> (usize, String) {
+    (
+        candidate.len().saturating_sub(typed.len()),
+        candidate.to_ascii_lowercase(),
+    )
+}
+
+fn shell_quote_for_remote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -778,8 +1214,27 @@ mod tests {
 
     #[test]
     fn long_input_keeps_cursor_inside_field() {
-        assert_eq!(input_view("short", 10), (0, 5));
-        assert_eq!(input_view("a very long remote path", 10), (14, 9));
+        assert_eq!(input_view("short", 5, 10), (0, 5));
+        assert_eq!(input_view("a very long remote path", 23, 10), (14, 9));
+    }
+
+    #[test]
+    fn editable_fields_insert_and_delete_at_the_cursor() {
+        let mut form = ProjectForm::new();
+        form.name = "ab".into();
+        form.cursor = 1;
+        form.insert('é');
+        assert_eq!(form.name, "aéb");
+        form.backspace();
+        assert_eq!(form.name, "ab");
+        form.delete_at_cursor();
+        assert_eq!(form.name, "a");
+    }
+
+    #[test]
+    fn fuzzy_path_matching_accepts_non_contiguous_letters() {
+        assert!(fuzzy_matches("~/work/avarya-api", "~/work/aai", "aai"));
+        assert!(!fuzzy_matches("~/work/api", "~/work/xyz", "xyz"));
     }
 
     #[test]
