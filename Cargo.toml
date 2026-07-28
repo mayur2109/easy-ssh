@@ -9,12 +9,12 @@ repository = "https://github.com/mayur2109/easy-ssh"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 glob = "0.3"
-ratatui = "0.29"
+ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.15"
-toml = "0.8"
+toml = "1.1"
 uuid = { version = "1.11", features = ["v4"] }
 
 [dev-dependencies]
