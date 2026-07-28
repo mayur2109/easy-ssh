@@ -1113,7 +1113,7 @@ fn lookup_remote_paths(
 fn split_path_query(value: &str) -> (String, String) {
     let trimmed = value.trim_end_matches('/');
     match trimmed.rsplit_once('/') {
-        Some((parent, fragment)) if parent.is_empty() => ("/".into(), fragment.into()),
+        Some(("", fragment)) => ("/".into(), fragment.into()),
         Some((parent, fragment)) => (parent.into(), fragment.into()),
         None => (".".into(), trimmed.into()),
     }
