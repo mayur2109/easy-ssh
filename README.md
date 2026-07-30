@@ -85,6 +85,11 @@ easy-ssh doctor
 easy-ssh doctor --shell bash --shell zsh
 ```
 
+Press Tab after a project argument to complete saved project names, for example
+`easy-ssh connect de<Tab>`. Completion is also available for `edit`, `remove`,
+and `session list|new|open`. After upgrading, run `easy-ssh install` and reload
+your shell to install the completion hook.
+
 Projects are stored in
 `${XDG_CONFIG_HOME:-~/.config}/easy-ssh/projects.toml`. Passwords are never
 stored; OpenSSH continues to handle keys, agents, and password prompts.

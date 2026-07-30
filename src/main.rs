@@ -62,6 +62,8 @@ enum Command {
     },
     #[command(name = "__is-project", hide = true)]
     IsProject { name: String },
+    #[command(name = "__complete-projects", hide = true)]
+    CompleteProjects,
 }
 
 #[derive(Debug, Subcommand)]
@@ -272,6 +274,10 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Some(Command::CompleteProjects) => {
+            print!("{}", project_completion_output(&file));
+            Ok(())
+        }
     }
 }
 
@@ -458,6 +464,15 @@ fn find_project<'a>(file: &'a model::ProjectFile, name: &str) -> Result<&'a Proj
         .with_context(|| format!("project {name:?} does not exist"))
 }
 
+fn project_completion_output(file: &model::ProjectFile) -> String {
+    file.projects
+        .iter()
+        .map(|project| project.name.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if file.projects.is_empty() { "" } else { "\n" }
+}
+
 fn persist(paths: &AppPaths, file: &model::ProjectFile) -> Result<()> {
     storage::save(paths, file)?;
     ssh::sync_generated_config(paths, file)
@@ -477,6 +492,32 @@ fn confirm_remove(name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_completion_output_lists_saved_project_names() {
+        let file = model::ProjectFile {
+            version: 1,
+            projects: vec![
+                Project {
+                    name: "api".into(),
+                    remote_path: "/srv/api".into(),
+                    connection: Connection::ExistingAlias {
+                        ssh_alias: "production".into(),
+                    },
+                },
+                Project {
+                    name: "app".into(),
+                    remote_path: "/srv/app".into(),
+                    connection: Connection::ExistingAlias {
+                        ssh_alias: "staging".into(),
+                    },
+                },
+            ],
+            settings: Default::default(),
+        };
+
+        assert_eq!(project_completion_output(&file), "api\napp\n");
+    }
 
     #[test]
     fn add_requires_exactly_one_connection_source() {
