@@ -128,7 +128,7 @@ pub fn install(paths: &AppPaths, file: &ProjectFile, shells: &[Shell]) -> Result
     }
     for shell in shells {
         let startup_file = shell.startup_file(paths);
-        if ensure_shell_hook(startup_file)? {
+        if ensure_shell_hook(startup_file, *shell)? {
             changes.push(format!("updated {}", startup_file.display()));
         }
     }
@@ -155,24 +155,37 @@ fn ensure_include(paths: &AppPaths) -> Result<bool> {
     Ok(true)
 }
 
-fn ensure_shell_hook(startup_file: &Path) -> Result<bool> {
+fn ensure_shell_hook(startup_file: &Path, shell: Shell) -> Result<bool> {
     let old = read_or_empty(startup_file)?;
-    if old.contains(HOOK_START) && old.contains(HOOK_END) {
+    let hook = shell_hook(shell);
+    if old.contains(hook) {
         return Ok(false);
     }
     backup_once(startup_file)?;
+    if let (Some(start), Some(end)) = (old.find(HOOK_START), old.find(HOOK_END)) {
+        let end = end + HOOK_END.len();
+        let new = format!("{}{}{}", &old[..start], hook, &old[end..]);
+        atomic_write(startup_file, new.as_bytes(), 0o600)?;
+        return Ok(true);
+    }
     let separator = if old.is_empty() || old.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    let new = format!("{old}{separator}\n{}\n", shell_hook());
+    let new = format!("{old}{separator}\n{hook}\n");
     atomic_write(startup_file, new.as_bytes(), 0o600)?;
     Ok(true)
 }
 
-pub fn shell_hook() -> &'static str {
-    r#"# >>> easy-ssh shell hook >>>
+pub fn shell_hook(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Bash => BASH_SHELL_HOOK,
+        Shell::Zsh => ZSH_SHELL_HOOK,
+    }
+}
+
+const BASH_SHELL_HOOK: &str = r#"# >>> easy-ssh shell hook >>>
 ssh() {
     if [ "$#" -eq 1 ] && command easy-ssh __is-project -- "$1"; then
         command easy-ssh connect -- "$1"
@@ -180,8 +193,58 @@ ssh() {
         command ssh "$@"
     fi
 }
-# <<< easy-ssh shell hook <<<"#
+# <<< easy-ssh shell hook <<<
+
+_easy_ssh_complete_project() {
+    COMPREPLY=( $(compgen -W "$(command easy-ssh __complete-projects)" -- "$1") )
 }
+
+_easy_ssh() {
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    case "${COMP_WORDS[1]}" in
+        connect|edit|remove)
+            [ "$COMP_CWORD" -eq 2 ] && _easy_ssh_complete_project "$current"
+            ;;
+        session)
+            case "${COMP_WORDS[2]}" in
+                list|new|open)
+                    [ "$COMP_CWORD" -eq 3 ] && _easy_ssh_complete_project "$current"
+                    ;;
+            esac
+            ;;
+    esac
+}
+complete -F _easy_ssh easy-ssh
+"#;
+
+const ZSH_SHELL_HOOK: &str = r#"# >>> easy-ssh shell hook >>>
+ssh() {
+    if [ "$#" -eq 1 ] && command easy-ssh __is-project -- "$1"; then
+        command easy-ssh connect -- "$1"
+    else
+        command ssh "$@"
+    fi
+}
+# <<< easy-ssh shell hook <<<
+
+_easy_ssh() {
+    local -a projects
+    projects=("${(@f)$(command easy-ssh __complete-projects)}")
+    case "$words[2]" in
+        connect|edit|remove)
+            (( CURRENT == 3 )) && _describe -t projects 'saved project' projects
+            ;;
+        session)
+            case "$words[3]" in
+                list|new|open)
+                    (( CURRENT == 4 )) && _describe -t projects 'saved project' projects
+                    ;;
+            esac
+            ;;
+    esac
+}
+compdef _easy_ssh easy-ssh
+"#;
 
 pub fn remote_command(remote_path: &str, agent: Agent) -> String {
     let _ = agent;
@@ -743,6 +806,16 @@ mod tests {
     }
 
     #[test]
+    fn zsh_hook_completes_project_arguments_dynamically() {
+        let hook = shell_hook(Shell::Zsh);
+
+        assert!(hook.contains("easy-ssh __complete-projects"));
+        assert!(hook.contains("connect|edit|remove"));
+        assert!(hook.contains("list|new|open"));
+        assert!(hook.contains("compdef _easy_ssh easy-ssh"));
+    }
+
+    #[test]
     fn installs_selected_shells_and_preserves_each_startup_file() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::for_home_and_config(temp.path().into(), temp.path().join("xdg"));
@@ -759,6 +832,25 @@ mod tests {
         assert!(zshrc.contains(HOOK_START));
         assert!(PathBuf::from(format!("{}.easy-ssh.bak", paths.bashrc.display())).exists());
         assert!(PathBuf::from(format!("{}.easy-ssh.bak", paths.zshrc.display())).exists());
+    }
+
+    #[test]
+    fn install_upgrades_an_existing_shell_hook() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::for_home_and_config(temp.path().into(), temp.path().join("xdg"));
+        fs::write(
+            &paths.zshrc,
+            "export EDITOR=vim\n\n# >>> easy-ssh shell hook >>>\nssh() { command ssh \"$@\"; }\n# <<< easy-ssh shell hook <<<\nexport LANG=C\n",
+        )
+        .unwrap();
+
+        install(&paths, &ProjectFile::default(), &[Shell::Zsh]).unwrap();
+
+        let zshrc = fs::read_to_string(&paths.zshrc).unwrap();
+        assert!(zshrc.starts_with("export EDITOR=vim\n\n"));
+        assert!(zshrc.ends_with("\nexport LANG=C\n"));
+        assert!(zshrc.contains("easy-ssh __complete-projects"));
+        assert_eq!(zshrc.matches(HOOK_START).count(), 1);
     }
 
     #[test]
